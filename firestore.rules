@@ -2,27 +2,57 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    function mail() {
-      return request.auth.token.email.lower();
-    }
     function signedIn() {
       return request.auth != null && request.auth.token.email_verified == true;
     }
-    function isOwner() {
-      return signedIn() && mail() == 'your.email@gmail.com';
-    }
-    function isMom() {
-      return signedIn() && mail() == 'mom.email@gmail.com';
+    function uid() { return request.auth.uid; }
+
+    // Check if the current user owns a given reimb
+    function isReimbOwner(reimbId) {
+      return signedIn() &&
+        get(/databases/$(database)/documents/reimbs/$(reimbId)).data.ownerUid == uid();
     }
 
-    match /expenses/{id} {
-      allow read: if isOwner() || isMom();
-      allow create: if isOwner()
-        && request.resource.data.amount is number
-        && request.resource.data.amount > 0;
-      allow update, delete: if isOwner();
+    // Check if the current user has access (owner OR was granted via token)
+    function hasReimbAccess(reimbId) {
+      return isReimbOwner(reimbId) || (
+        signedIn() &&
+        exists(/databases/$(database)/documents/users/$(uid())) &&
+        reimbId in get(/databases/$(database)/documents/users/$(uid())).data.grantedReimbs
+      );
     }
 
+    // ── Users store their own granted reimb IDs ──
+    match /users/{userId} {
+      allow read, write: if signedIn() && request.auth.uid == userId;
+    }
+
+    // ── Token lookup docs: token → reimbId ──
+    // Any signed-in user can read a token to look up the reimb.
+    // Only the owner of the referenced reimb may create/delete a token.
+    match /tokens/{token} {
+      allow read: if signedIn();
+      allow create: if signedIn() &&
+        get(/databases/$(database)/documents/reimbs/$(request.resource.data.reimbId)).data.ownerUid == uid();
+      allow delete: if signedIn() &&
+        get(/databases/$(database)/documents/reimbs/$(resource.data.reimbId)).data.ownerUid == uid();
+      allow update: if false;
+    }
+
+    // ── Reimbs ──
+    match /reimbs/{reimbId} {
+      allow read:          if hasReimbAccess(reimbId);
+      allow create:        if signedIn() && request.resource.data.ownerUid == uid();
+      allow update, delete: if isReimbOwner(reimbId);
+
+      // Expenses live as a subcollection
+      match /expenses/{expId} {
+        allow read:               if hasReimbAccess(reimbId);
+        allow create, update, delete: if isReimbOwner(reimbId);
+      }
+    }
+
+    // Deny everything else
     match /{document=**} {
       allow read, write: if false;
     }

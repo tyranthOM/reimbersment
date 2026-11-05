@@ -1,0 +1,30 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function mail() {
+      return request.auth.token.email.lower();
+    }
+    function signedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+    function isOwner() {
+      return signedIn() && mail() == 'your.email@gmail.com';
+    }
+    function isMom() {
+      return signedIn() && mail() == 'mom.email@gmail.com';
+    }
+
+    match /expenses/{id} {
+      allow read: if isOwner() || isMom();
+      allow create: if isOwner()
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0;
+      allow update, delete: if isOwner();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

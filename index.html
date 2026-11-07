@@ -30,6 +30,12 @@ header{display:flex;justify-content:space-between;align-items:flex-start;gap:10p
 .auth-box label{display:block;font-size:13px;font-weight:600;margin-bottom:6px;color:var(--mut)}
 .auth-box input{margin-bottom:12px}
 
+/* Timer & Code Alert */
+.timer-pill{display:inline-block;padding:3px 10px;background:rgba(31,111,92,.12);color:var(--ac);font-weight:700;font-size:13px;border-radius:20px;margin-bottom:12px}
+.timer-pill.expired{background:rgba(179,38,30,.12);color:var(--bad)}
+.code-preview{background:var(--bg);border:1px dashed var(--ac);border-radius:8px;padding:12px;text-align:center;margin-bottom:14px}
+.code-preview b{font-size:24px;letter-spacing:4px;color:var(--ac);display:block;margin:4px 0}
+
 /* Dashboard */
 .dash-actions{display:flex;gap:8px;margin:20px 0 16px}
 .card{background:var(--sf);border:1px solid var(--ln);border-radius:12px;padding:14px 16px;margin-bottom:10px;cursor:pointer;transition:border-color .15s,box-shadow .15s}
@@ -96,6 +102,9 @@ let authToken = localStorage.getItem("reimb_token") || null;
 let screen = "dash";
 let authStep = "email"; // 'email' or 'otp'
 let tempEmail = "";
+let displayCode = null;
+let countdownSeconds = 120; // 2 minutes
+let timerInterval = null;
 
 let reimbsList = [];
 let currentReimb = null, items = [];
@@ -125,7 +134,6 @@ async function api(path, options = {}) {
   const data = await res.json().catch(() => ({}));
 
   if (res.status === 401) {
-    // Session expired
     signOut();
     throw new Error("Session expired. Please log in again.");
   }
@@ -144,7 +152,30 @@ function signOut() {
   currentReimb = null;
   reimbsList = [];
   authStep = "email";
+  if (timerInterval) clearInterval(timerInterval);
   render();
+}
+
+function startCountdown() {
+  if (timerInterval) clearInterval(timerInterval);
+  countdownSeconds = 120; // 2 minutes
+  timerInterval = setInterval(() => {
+    countdownSeconds--;
+    const timerEl = document.getElementById("timerPill");
+    if (timerEl) {
+      if (countdownSeconds <= 0) {
+        clearInterval(timerInterval);
+        timerEl.textContent = "Code Expired (2m passed)";
+        timerEl.className = "timer-pill expired";
+        const vBtn = document.getElementById("verifyOtpBtn");
+        if (vBtn) vBtn.disabled = true;
+      } else {
+        const mins = Math.floor(countdownSeconds / 60);
+        const secs = countdownSeconds % 60;
+        timerEl.textContent = `Valid for ${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+      }
+    }
+  }, 1000);
 }
 
 // ── Data Loading ──
@@ -213,7 +244,7 @@ function renderLogin() {
     $app.innerHTML = `
       <div class="center">
         <h1>Expense book</h1>
-        <p>Pure PostgreSQL expense tracker. Access from any device.</p>
+        <p>PostgreSQL expense tracker. Access from any device.</p>
         <div class="auth-box">
           <label>Your Email Address</label>
           <input id="loginEmail" type="email" placeholder="e.g. name@example.com" value="${esc(tempEmail)}">
@@ -229,19 +260,17 @@ function renderLogin() {
         msg.innerHTML = `<div class="err">Please enter a valid email address.</div>`;
         return;
       }
-      msg.innerHTML = `<div class="info">Generating code...</div>`;
+      msg.innerHTML = `<div class="info">Sending 2-minute code...</div>`;
       try {
         const res = await api('/api/auth/send-otp', {
           method: 'POST',
           body: JSON.stringify({ email })
         });
         tempEmail = email;
+        displayCode = res.displayCode || null;
         authStep = "otp";
         render();
-        // Show the code directly in helper box for convenience
-        setTimeout(() => {
-          showErr(`Your login code is: ${res.code}`);
-        }, 500);
+        startCountdown();
       } catch (err) {
         msg.innerHTML = `<div class="err">${esc(err.message)}</div>`;
       }
@@ -250,18 +279,53 @@ function renderLogin() {
     $app.innerHTML = `
       <div class="center">
         <h1>Enter Login Code</h1>
-        <p>Code sent for <b>${esc(tempEmail)}</b></p>
+        <p>Sent to <b>${esc(tempEmail)}</b></p>
         <div class="auth-box">
+          <div style="text-align:center">
+            <span id="timerPill" class="timer-pill">Valid for 02:00</span>
+          </div>
+
+          ${displayCode ? `
+            <div class="code-preview">
+              <span style="font-size:12px;color:var(--mut)">Your 2-Minute Login Code:</span>
+              <b>${displayCode}</b>
+            </div>
+          ` : `
+            <div class="info" style="margin-bottom:12px">
+              Check your inbox! We sent your 6-digit login code.
+            </div>
+          `}
+
           <label>6-Digit Code</label>
-          <input id="otpCode" type="text" maxlength="6" inputmode="numeric" placeholder="123456" autofocus>
+          <input id="otpCode" type="text" maxlength="6" inputmode="numeric" placeholder="123456" value="${displayCode || ''}" autofocus>
           <button class="btn pri full" id="verifyOtpBtn" style="width:100%">Sign In</button>
-          <button class="btn sm" id="backToEmail" style="width:100%;margin-top:8px">Use different email</button>
+          <div style="display:flex;gap:6px;margin-top:8px">
+            <button class="btn sm" id="resendCodeBtn" style="flex:1">Resend Code</button>
+            <button class="btn sm" id="backToEmail" style="flex:1">Change email</button>
+          </div>
           <div id="loginMsg"></div>
         </div>
       </div>`;
 
     document.getElementById("backToEmail").onclick = () => {
+      if (timerInterval) clearInterval(timerInterval);
       authStep = "email"; render();
+    };
+
+    document.getElementById("resendCodeBtn").onclick = async () => {
+      const msg = document.getElementById("loginMsg");
+      msg.innerHTML = `<div class="info">Generating new 2-minute code...</div>`;
+      try {
+        const res = await api('/api/auth/send-otp', {
+          method: 'POST',
+          body: JSON.stringify({ email: tempEmail })
+        });
+        displayCode = res.displayCode || null;
+        render();
+        startCountdown();
+      } catch(e) {
+        msg.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+      }
     };
 
     document.getElementById("verifyOtpBtn").onclick = async () => {
@@ -277,12 +341,14 @@ function renderLogin() {
           method: 'POST',
           body: JSON.stringify({ email: tempEmail, code })
         });
+        if (timerInterval) clearInterval(timerInterval);
         authToken = res.token;
         currentUser = res.user;
         localStorage.setItem("reimb_token", authToken);
         localStorage.setItem("reimb_user", JSON.stringify(currentUser));
         authStep = "email";
         tempEmail = "";
+        displayCode = null;
         await loadDashboard();
       } catch (err) {
         msg.innerHTML = `<div class="err">${esc(err.message)}</div>`;

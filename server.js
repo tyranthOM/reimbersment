@@ -3,6 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 require('dotenv').config();
 
 const app = express();
@@ -80,6 +81,41 @@ async function initDb() {
   }
 }
 
+// ── Nodemailer Mailer Setup ──
+let transporter = null;
+if (process.env.SMTP_EMAIL && process.env.SMTP_PASSWORD) {
+  transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.SMTP_EMAIL,
+      pass: process.env.SMTP_PASSWORD // App password
+    }
+  });
+  console.log('Email delivery configured with:', process.env.SMTP_EMAIL);
+} else {
+  console.log('SMTP_EMAIL / SMTP_PASSWORD not set. Codes will be logged to server console.');
+}
+
+async function sendEmailOtp(toEmail, code) {
+  if (transporter) {
+    await transporter.sendMail({
+      from: `"Expense Book" <${process.env.SMTP_EMAIL}>`,
+      to: toEmail,
+      subject: `Your Login Code: ${code}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #d2dbd7;border-radius:10px">
+          <h2 style="color:#1f6f5c;margin-top:0">Expense Book Login</h2>
+          <p>Your one-time login code is:</p>
+          <div style="font-size:32px;font-weight:bold;letter-spacing:6px;color:#17201d;background:#eef1f0;padding:12px;border-radius:8px;text-align:center;margin:16px 0">
+            ${code}
+          </div>
+          <p style="color:#62716b;font-size:13px">This code is valid for <b>2 minutes</b>. If you did not request this, you can ignore this email.</p>
+        </div>
+      `
+    });
+  }
+}
+
 // ── JWT Auth Middleware ──
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -90,7 +126,7 @@ function requireAuth(req, res, next) {
   const token = authHeader.split('Bearer ')[1];
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload; // { id, email }
+    req.user = payload;
     next();
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired session' });
@@ -108,9 +144,9 @@ function genReimbToken() {
   return t;
 }
 
-// ── Authentication Endpoints (Pure Postgres OTP) ──
+// ── Authentication Endpoints ──
 
-// 1. Request OTP Code
+// 1. Send OTP (2-minute expiration)
 app.post('/api/auth/send-otp', async (req, res) => {
   try {
     let { email } = req.body;
@@ -121,7 +157,11 @@ app.post('/api/auth/send-otp', async (req, res) => {
 
     // Generate 6-digit code
     const code = Math.floor(100000 + Math.random() * 900000).toString();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+    // STRICT 2-MINUTE WINDOW (120 seconds)
+    const expiresAt = new Date(Date.now() + 2 * 60 * 1000);
+
+    // Delete any old OTPs for this email first
+    await pool.query(`DELETE FROM login_otps WHERE email = $1`, [email]);
 
     // Store in Postgres
     await pool.query(
@@ -129,13 +169,26 @@ app.post('/api/auth/send-otp', async (req, res) => {
       [email, code, expiresAt]
     );
 
-    console.log(`[LOGIN OTP] Code for ${email} is: ${code}`);
+    console.log(`[LOGIN OTP] Valid for 2 minutes for ${email}: ${code}`);
 
-    // Return the code in response (so user can log in instantly without needing email API configured)
+    // Send actual email if SMTP configured
+    let emailSent = false;
+    if (transporter) {
+      try {
+        await sendEmailOtp(email, code);
+        emailSent = true;
+      } catch (mailErr) {
+        console.error('Mail sending failed:', mailErr);
+      }
+    }
+
     res.json({
       success: true,
-      message: 'OTP generated',
-      code: code // Displayed or used directly
+      message: emailSent ? `Login code sent to ${email}` : 'Login code generated',
+      emailSent: emailSent,
+      // Backup display code if mail server not set up yet
+      displayCode: !emailSent ? code : undefined,
+      expiresInSeconds: 120
     });
   } catch (err) {
     console.error('Send OTP error:', err);
@@ -143,7 +196,7 @@ app.post('/api/auth/send-otp', async (req, res) => {
   }
 });
 
-// 2. Verify OTP and return session JWT
+// 2. Verify OTP (strictly within 2 minutes)
 app.post('/api/auth/verify-otp', async (req, res) => {
   try {
     let { email, code } = req.body;
@@ -153,7 +206,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     email = email.trim().toLowerCase();
     code = code.trim();
 
-    // Verify OTP in Postgres
+    // Check if OTP exists and is NOT expired (< 2 minutes old)
     const otpRes = await pool.query(
       `SELECT * FROM login_otps
        WHERE email = $1 AND code = $2 AND expires_at > NOW()
@@ -162,10 +215,18 @@ app.post('/api/auth/verify-otp', async (req, res) => {
     );
 
     if (otpRes.rows.length === 0) {
-      return res.status(400).json({ error: 'Invalid or expired OTP code' });
+      // Check if it existed but expired
+      const expiredCheck = await pool.query(
+        `SELECT * FROM login_otps WHERE email = $1 AND code = $2 LIMIT 1`,
+        [email, code]
+      );
+      if (expiredCheck.rows.length > 0) {
+        return res.status(400).json({ error: 'Code expired! The 2-minute window has passed. Please request a new one.' });
+      }
+      return res.status(400).json({ error: 'Invalid login code. Please check and try again.' });
     }
 
-    // Delete used OTPs for this email
+    // Delete used OTP
     await pool.query(`DELETE FROM login_otps WHERE email = $1`, [email]);
 
     // Upsert user in Postgres

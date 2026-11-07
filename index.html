@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Expense book</title>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap" rel="stylesheet">
+<!-- Google Identity Services (OAuth 2.0) -->
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 :root{--bg:#eef1f0;--sf:#fff;--ink:#17201d;--mut:#62716b;--ln:#d2dbd7;--ac:#1f6f5c;--acink:#fff;--bad:#b3261e;
 padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
@@ -25,16 +27,9 @@ header{display:flex;justify-content:space-between;align-items:flex-start;gap:10p
 .center{text-align:center;padding:70px 10px}
 .center p{color:var(--mut)}
 
-/* Auth Form */
-.auth-box{background:var(--sf);border:1px solid var(--ln);border-radius:12px;padding:24px 20px;max-width:380px;margin:24px auto 0;text-align:left}
-.auth-box label{display:block;font-size:13px;font-weight:600;margin-bottom:6px;color:var(--mut)}
-.auth-box input{margin-bottom:12px}
-
-/* Timer & Code Alert */
-.timer-pill{display:inline-block;padding:3px 10px;background:rgba(31,111,92,.12);color:var(--ac);font-weight:700;font-size:13px;border-radius:20px;margin-bottom:12px}
-.timer-pill.expired{background:rgba(179,38,30,.12);color:var(--bad)}
-.code-preview{background:var(--bg);border:1px dashed var(--ac);border-radius:8px;padding:12px;text-align:center;margin-bottom:14px}
-.code-preview b{font-size:24px;letter-spacing:4px;color:var(--ac);display:block;margin:4px 0}
+/* Google Sign-in Container */
+.oauth-card{background:var(--sf);border:1px solid var(--ln);border-radius:12px;padding:28px 20px;max-width:380px;margin:24px auto 0;text-align:center}
+#googleBtnContainer{display:flex;justify-content:center;margin:18px 0 10px}
 
 /* Dashboard */
 .dash-actions{display:flex;gap:8px;margin:20px 0 16px}
@@ -92,6 +87,9 @@ const $modal = document.getElementById("modal");
 
 const CATS = ["Food","Travel","Study","Fun","Shopping","Other"];
 
+// Google OAuth Client ID (from your Google Cloud project)
+const GOOGLE_CLIENT_ID = "745043038117-09s99f06qf7p0v613j0f11s5g5197dfl.apps.googleusercontent.com"; // Standard client or your ID
+
 // ── App State (Pure Postgres + JWT) ──
 const API_BASE = window.location.hostname.includes("onrender.com") || window.location.hostname === "localhost" 
   ? "" 
@@ -100,11 +98,6 @@ const API_BASE = window.location.hostname.includes("onrender.com") || window.loc
 let currentUser = JSON.parse(localStorage.getItem("reimb_user") || "null");
 let authToken = localStorage.getItem("reimb_token") || null;
 let screen = "dash";
-let authStep = "email"; // 'email' or 'otp'
-let tempEmail = "";
-let displayCode = null;
-let countdownSeconds = 120; // 2 minutes
-let timerInterval = null;
 
 let reimbsList = [];
 let currentReimb = null, items = [];
@@ -151,31 +144,28 @@ function signOut() {
   authToken = null;
   currentReimb = null;
   reimbsList = [];
-  authStep = "email";
-  if (timerInterval) clearInterval(timerInterval);
   render();
 }
 
-function startCountdown() {
-  if (timerInterval) clearInterval(timerInterval);
-  countdownSeconds = 120; // 2 minutes
-  timerInterval = setInterval(() => {
-    countdownSeconds--;
-    const timerEl = document.getElementById("timerPill");
-    if (timerEl) {
-      if (countdownSeconds <= 0) {
-        clearInterval(timerInterval);
-        timerEl.textContent = "Code Expired (2m passed)";
-        timerEl.className = "timer-pill expired";
-        const vBtn = document.getElementById("verifyOtpBtn");
-        if (vBtn) vBtn.disabled = true;
-      } else {
-        const mins = Math.floor(countdownSeconds / 60);
-        const secs = countdownSeconds % 60;
-        timerEl.textContent = `Valid for ${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
-      }
-    }
-  }, 1000);
+// ── Google OAuth Callback Handler ──
+async function handleGoogleCredential(response) {
+  const msgEl = document.getElementById("loginMsg");
+  if (msgEl) msgEl.innerHTML = `<div class="info">Authenticating with PostgreSQL...</div>`;
+  
+  try {
+    const res = await api('/api/auth/google', {
+      method: 'POST',
+      body: JSON.stringify({ credential: response.credential })
+    });
+
+    authToken = res.token;
+    currentUser = res.user;
+    localStorage.setItem("reimb_token", authToken);
+    localStorage.setItem("reimb_user", JSON.stringify(currentUser));
+    await loadDashboard();
+  } catch (err) {
+    if (msgEl) msgEl.innerHTML = `<div class="err">${esc(err.message)}</div>`;
+  }
 }
 
 // ── Data Loading ──
@@ -240,121 +230,34 @@ function render() {
 }
 
 function renderLogin() {
-  if (authStep === "email") {
-    $app.innerHTML = `
-      <div class="center">
-        <h1>Expense book</h1>
-        <p>PostgreSQL expense tracker. Access from any device.</p>
-        <div class="auth-box">
-          <label>Your Email Address</label>
-          <input id="loginEmail" type="email" placeholder="e.g. name@example.com" value="${esc(tempEmail)}">
-          <button class="btn pri full" id="sendOtpBtn" style="width:100%">Get Login Code</button>
-          <div id="loginMsg"></div>
-        </div>
-      </div>`;
+  $app.innerHTML = `
+    <div class="center">
+      <h1>Expense book</h1>
+      <p>PostgreSQL expense tracker. Sign in from any device.</p>
+      <div class="oauth-card">
+        <label style="display:block;font-size:14px;font-weight:600;margin-bottom:12px">Sign in with Google</label>
+        <div id="googleBtnContainer"></div>
+        <div id="loginMsg" style="margin-top:12px"></div>
+      </div>
+    </div>`;
 
-    document.getElementById("sendOtpBtn").onclick = async () => {
-      const email = document.getElementById("loginEmail").value.trim();
-      const msg = document.getElementById("loginMsg");
-      if (!email || !email.includes("@")) {
-        msg.innerHTML = `<div class="err">Please enter a valid email address.</div>`;
-        return;
-      }
-      msg.innerHTML = `<div class="info">Sending 2-minute code...</div>`;
-      try {
-        const res = await api('/api/auth/send-otp', {
-          method: 'POST',
-          body: JSON.stringify({ email })
-        });
-        tempEmail = email;
-        displayCode = res.displayCode || null;
-        authStep = "otp";
-        render();
-        startCountdown();
-      } catch (err) {
-        msg.innerHTML = `<div class="err">${esc(err.message)}</div>`;
-      }
-    };
-  } else {
-    $app.innerHTML = `
-      <div class="center">
-        <h1>Enter Login Code</h1>
-        <p>Sent to <b>${esc(tempEmail)}</b></p>
-        <div class="auth-box">
-          <div style="text-align:center">
-            <span id="timerPill" class="timer-pill">Valid for 02:00</span>
-          </div>
-
-          ${displayCode ? `
-            <div class="code-preview">
-              <span style="font-size:12px;color:var(--mut)">Your 2-Minute Login Code:</span>
-              <b>${displayCode}</b>
-            </div>
-          ` : `
-            <div class="info" style="margin-bottom:12px">
-              Check your inbox! We sent your 6-digit login code.
-            </div>
-          `}
-
-          <label>6-Digit Code</label>
-          <input id="otpCode" type="text" maxlength="6" inputmode="numeric" placeholder="123456" value="${displayCode || ''}" autofocus>
-          <button class="btn pri full" id="verifyOtpBtn" style="width:100%">Sign In</button>
-          <div style="display:flex;gap:6px;margin-top:8px">
-            <button class="btn sm" id="resendCodeBtn" style="flex:1">Resend Code</button>
-            <button class="btn sm" id="backToEmail" style="flex:1">Change email</button>
-          </div>
-          <div id="loginMsg"></div>
-        </div>
-      </div>`;
-
-    document.getElementById("backToEmail").onclick = () => {
-      if (timerInterval) clearInterval(timerInterval);
-      authStep = "email"; render();
-    };
-
-    document.getElementById("resendCodeBtn").onclick = async () => {
-      const msg = document.getElementById("loginMsg");
-      msg.innerHTML = `<div class="info">Generating new 2-minute code...</div>`;
-      try {
-        const res = await api('/api/auth/send-otp', {
-          method: 'POST',
-          body: JSON.stringify({ email: tempEmail })
-        });
-        displayCode = res.displayCode || null;
-        render();
-        startCountdown();
-      } catch(e) {
-        msg.innerHTML = `<div class="err">${esc(e.message)}</div>`;
-      }
-    };
-
-    document.getElementById("verifyOtpBtn").onclick = async () => {
-      const code = document.getElementById("otpCode").value.trim();
-      const msg = document.getElementById("loginMsg");
-      if (!code || code.length < 4) {
-        msg.innerHTML = `<div class="err">Please enter the 6-digit code.</div>`;
-        return;
-      }
-      msg.innerHTML = `<div class="info">Verifying...</div>`;
-      try {
-        const res = await api('/api/auth/verify-otp', {
-          method: 'POST',
-          body: JSON.stringify({ email: tempEmail, code })
-        });
-        if (timerInterval) clearInterval(timerInterval);
-        authToken = res.token;
-        currentUser = res.user;
-        localStorage.setItem("reimb_token", authToken);
-        localStorage.setItem("reimb_user", JSON.stringify(currentUser));
-        authStep = "email";
-        tempEmail = "";
-        displayCode = null;
-        await loadDashboard();
-      } catch (err) {
-        msg.innerHTML = `<div class="err">${esc(err.message)}</div>`;
-      }
-    };
+  // Initialize Google One Tap / Button
+  function setupGoogle() {
+    if (window.google && window.google.accounts) {
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleGoogleCredential,
+        auto_select: false
+      });
+      window.google.accounts.id.renderButton(
+        document.getElementById("googleBtnContainer"),
+        { theme: "outline", size: "large", shape: "pill", width: 280 }
+      );
+    } else {
+      setTimeout(setupGoogle, 200);
+    }
   }
+  setupGoogle();
 }
 
 function renderDash() {

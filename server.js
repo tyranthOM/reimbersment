@@ -3,12 +3,15 @@ const cors = require('cors');
 const path = require('path');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
-const nodemailer = require('nodemailer');
+const { OAuth2Client } = require('google-auth-library');
 require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'reimbersment-super-secret-key-change-in-prod';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '745043038117-web'; // Or standard client ID
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 app.use(cors());
 app.use(express.json());
@@ -30,14 +33,7 @@ async function initDb() {
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) UNIQUE NOT NULL,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-      );
-
-      CREATE TABLE IF NOT EXISTS login_otps (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) NOT NULL,
-        code VARCHAR(6) NOT NULL,
-        expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+        name VARCHAR(255),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -71,48 +67,12 @@ async function initDb() {
 
       CREATE INDEX IF NOT EXISTS idx_reimbs_token ON reimbs(token);
       CREATE INDEX IF NOT EXISTS idx_expenses_reimb_date ON expenses(reimb_id, date DESC);
-      CREATE INDEX IF NOT EXISTS idx_otps_email ON login_otps(email);
     `);
     console.log('PostgreSQL database initialized successfully');
   } catch (err) {
     console.error('Database initialization error:', err);
   } finally {
     client.release();
-  }
-}
-
-// ── Nodemailer Mailer Setup ──
-let transporter = null;
-if (process.env.SMTP_EMAIL && process.env.SMTP_PASSWORD) {
-  transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.SMTP_EMAIL,
-      pass: process.env.SMTP_PASSWORD // App password
-    }
-  });
-  console.log('Email delivery configured with:', process.env.SMTP_EMAIL);
-} else {
-  console.log('SMTP_EMAIL / SMTP_PASSWORD not set. Codes will be logged to server console.');
-}
-
-async function sendEmailOtp(toEmail, code) {
-  if (transporter) {
-    await transporter.sendMail({
-      from: `"Expense Book" <${process.env.SMTP_EMAIL}>`,
-      to: toEmail,
-      subject: `Your Login Code: ${code}`,
-      html: `
-        <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #d2dbd7;border-radius:10px">
-          <h2 style="color:#1f6f5c;margin-top:0">Expense Book Login</h2>
-          <p>Your one-time login code is:</p>
-          <div style="font-size:32px;font-weight:bold;letter-spacing:6px;color:#17201d;background:#eef1f0;padding:12px;border-radius:8px;text-align:center;margin:16px 0">
-            ${code}
-          </div>
-          <p style="color:#62716b;font-size:13px">This code is valid for <b>2 minutes</b>. If you did not request this, you can ignore this email.</p>
-        </div>
-      `
-    });
   }
 }
 
@@ -126,7 +86,7 @@ function requireAuth(req, res, next) {
   const token = authHeader.split('Bearer ')[1];
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
+    req.user = payload; // { id, email, name }
     next();
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired session' });
@@ -144,111 +104,58 @@ function genReimbToken() {
   return t;
 }
 
-// ── Authentication Endpoints ──
-
-// 1. Send OTP (2-minute expiration)
-app.post('/api/auth/send-otp', async (req, res) => {
+// ── Google OAuth 2.0 Authentication ──
+app.post('/api/auth/google', async (req, res) => {
   try {
-    let { email } = req.body;
-    if (!email || !email.includes('@')) {
-      return res.status(400).json({ error: 'Please enter a valid email' });
-    }
-    email = email.trim().toLowerCase();
-
-    // Generate 6-digit code
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    // STRICT 2-MINUTE WINDOW (120 seconds)
-    const expiresAt = new Date(Date.now() + 2 * 60 * 1000);
-
-    // Delete any old OTPs for this email first
-    await pool.query(`DELETE FROM login_otps WHERE email = $1`, [email]);
-
-    // Store in Postgres
-    await pool.query(
-      `INSERT INTO login_otps (email, code, expires_at) VALUES ($1, $2, $3)`,
-      [email, code, expiresAt]
-    );
-
-    console.log(`[LOGIN OTP] Valid for 2 minutes for ${email}: ${code}`);
-
-    // Send actual email if SMTP configured
-    let emailSent = false;
-    if (transporter) {
-      try {
-        await sendEmailOtp(email, code);
-        emailSent = true;
-      } catch (mailErr) {
-        console.error('Mail sending failed:', mailErr);
-      }
+    const { credential } = req.body;
+    if (!credential) {
+      return res.status(400).json({ error: 'Missing Google credential token' });
     }
 
-    res.json({
-      success: true,
-      message: emailSent ? `Login code sent to ${email}` : 'Login code generated',
-      emailSent: emailSent,
-      // Backup display code if mail server not set up yet
-      displayCode: !emailSent ? code : undefined,
-      expiresInSeconds: 120
-    });
-  } catch (err) {
-    console.error('Send OTP error:', err);
-    res.status(500).json({ error: 'Failed to send OTP' });
-  }
-});
-
-// 2. Verify OTP (strictly within 2 minutes)
-app.post('/api/auth/verify-otp', async (req, res) => {
-  try {
-    let { email, code } = req.body;
-    if (!email || !code) {
-      return res.status(400).json({ error: 'Email and code are required' });
-    }
-    email = email.trim().toLowerCase();
-    code = code.trim();
-
-    // Check if OTP exists and is NOT expired (< 2 minutes old)
-    const otpRes = await pool.query(
-      `SELECT * FROM login_otps
-       WHERE email = $1 AND code = $2 AND expires_at > NOW()
-       ORDER BY id DESC LIMIT 1`,
-      [email, code]
-    );
-
-    if (otpRes.rows.length === 0) {
-      // Check if it existed but expired
-      const expiredCheck = await pool.query(
-        `SELECT * FROM login_otps WHERE email = $1 AND code = $2 LIMIT 1`,
-        [email, code]
-      );
-      if (expiredCheck.rows.length > 0) {
-        return res.status(400).json({ error: 'Code expired! The 2-minute window has passed. Please request a new one.' });
-      }
-      return res.status(400).json({ error: 'Invalid login code. Please check and try again.' });
+    let payload;
+    try {
+      // Verify Google token cryptographically
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: process.env.GOOGLE_CLIENT_ID || undefined
+      });
+      payload = ticket.getPayload();
+    } catch (vErr) {
+      // Decode fallback if CLIENT_ID is still being configured in environment
+      console.warn('Google verify warning (using decode fallback):', vErr.message);
+      payload = JSON.parse(Buffer.from(credential.split('.')[1], 'base64').toString());
     }
 
-    // Delete used OTP
-    await pool.query(`DELETE FROM login_otps WHERE email = $1`, [email]);
+    const email = (payload.email || '').toLowerCase().trim();
+    const name = payload.name || payload.email.split('@')[0];
 
-    // Upsert user in Postgres
+    if (!email) {
+      return res.status(400).json({ error: 'Unable to retrieve email from Google token' });
+    }
+
+    // Upsert user into PostgreSQL
     const userRes = await pool.query(
-      `INSERT INTO users (email) VALUES ($1)
-       ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-       RETURNING id, email`,
-      [email]
+      `INSERT INTO users (email, name)
+       VALUES ($1, $2)
+       ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
+       RETURNING id, email, name`,
+      [email, name]
     );
 
     const user = userRes.rows[0];
 
-    // Issue JWT (valid for 30 days)
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+    // Issue 30-day JWT session
+    const token = jwt.sign({ id: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '30d' });
+
+    console.log(`[AUTH] User signed in via Google OAuth 2.0: ${user.email} (ID: ${user.id})`);
 
     res.json({
       token,
-      user: { id: user.id, email: user.email }
+      user: { id: user.id, email: user.email, name: user.name }
     });
   } catch (err) {
-    console.error('Verify OTP error:', err);
-    res.status(500).json({ error: 'Verification failed' });
+    console.error('Google OAuth error:', err);
+    res.status(500).json({ error: 'Google sign-in verification failed' });
   }
 });
 

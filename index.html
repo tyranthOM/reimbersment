@@ -77,9 +77,6 @@ code{font-size:22px;font-weight:800;letter-spacing:3px;background:var(--bg);padd
 import {initializeApp} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
 import {getAuth,GoogleAuthProvider,signInWithPopup,signOut,onAuthStateChanged}
   from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import {getFirestore,collection,addDoc,deleteDoc,doc,onSnapshot,query,orderBy,
-  serverTimestamp,setDoc,getDoc,getDocs,where,arrayUnion}
-  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
 const firebaseConfig = {
   apiKey:            "AIzaSyAXSCZ2Wqv3Jw6diMNhX9KUMA3BWFgq_PI",
@@ -92,7 +89,6 @@ const firebaseConfig = {
 
 const app  = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db   = getFirestore(app);
 const $app   = document.getElementById("app");
 const $modal = document.getElementById("modal");
 
@@ -100,107 +96,103 @@ const CATS = ["Food","Travel","Study","Fun","Shopping","Other"];
 
 // ── State ──
 let user = null, screen = "dash";
-let myReimbs = [], grantedReimbs = [];
+let reimbsList = [];
 let currentReimb = null, items = [];
 let month  = new Date().toISOString().slice(0,7);
-let unsub  = null, loading = false;
+let loading = false;
 
 // ── Helpers ──
-const esc = s => String(s).replace(/[&<>"']/g, c =>
+const esc = s => String(s || "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const inr   = n => "₹" + Math.round(n).toLocaleString("en-IN");
+const inr   = n => "₹" + Math.round(Number(n)).toLocaleString("en-IN");
 const shift = (m,d) => { const [y,mo] = m.split("-").map(Number);
   const dt = new Date(y, mo-1+d, 1);
   return dt.getFullYear()+"-"+String(dt.getMonth()+1).padStart(2,"0"); };
 const label = m => { const [y,mo] = m.split("-").map(Number);
   return new Date(y,mo-1,1).toLocaleDateString("en-IN",{month:"long",year:"numeric"}); };
 
-function genToken() {
-  const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let t = "";
-  for (let i = 0; i < 8; i++) { if (i===4) t+="-"; t += c[Math.floor(Math.random()*c.length)]; }
-  return t;
+// API Fetch Helper with Firebase Token
+async function api(path, options = {}) {
+  if (!user) throw new Error("Not logged in");
+  const token = await user.getIdToken();
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${token}`,
+    ...(options.headers || {})
+  };
+
+  const res = await fetch(path, { ...options, headers });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `HTTP error ${res.status}`);
+  }
+  return data;
 }
 
 // ── Auth ──
 onAuthStateChanged(auth, async u => {
-  if (unsub) { unsub(); unsub = null; }
   user = u; items = []; currentReimb = null; screen = "dash";
   if (u) await loadDashboard();
   render();
 });
 
-// ── Data ──
+// ── Data (from PostgreSQL via API) ──
 async function loadDashboard() {
   loading = true; render();
-  const [ownSnap, userDoc] = await Promise.all([
-    getDocs(query(collection(db,"reimbs"), where("ownerUid","==",user.uid))),
-    getDoc(doc(db,"users",user.uid))
-  ]);
-  myReimbs = ownSnap.docs.map(d => ({id:d.id, ...d.data(), role:"owner"}));
-  const gids = (userDoc.exists() && userDoc.data().grantedReimbs) || [];
-  grantedReimbs = (await Promise.all(
-    gids.map(async rid => {
-      try { const rd = await getDoc(doc(db,"reimbs",rid));
-            return rd.exists() ? {id:rd.id, ...rd.data(), role:"viewer"} : null; }
-      catch { return null; }
-    })
-  )).filter(Boolean);
-  loading = false; render();
+  try {
+    reimbsList = await api('/api/reimbs');
+  } catch (err) {
+    showErr("Error loading reimbs: " + err.message);
+  } finally {
+    loading = false; render();
+  }
 }
 
 async function createReimb(name) {
-  const token = genToken();
-  const ref = await addDoc(collection(db,"reimbs"), {
-    name, ownerUid: user.uid,
-    ownerEmail: user.email.toLowerCase(),
-    token, createdAt: serverTimestamp()
+  const r = await api('/api/reimbs', {
+    method: 'POST',
+    body: JSON.stringify({ name })
   });
-  // token → reimbId lookup doc (public readable, so anyone can join)
-  await setDoc(doc(db,"tokens",token), {reimbId: ref.id, ownerUid: user.uid});
-  const r = {id:ref.id, name, ownerUid:user.uid,
-             ownerEmail:user.email.toLowerCase(), token, role:"owner"};
-  myReimbs = [r, ...myReimbs];
-  openReimb(r);
+  reimbsList = [r, ...reimbsList];
+  await openReimb(r);
 }
 
 async function joinWithToken(raw) {
-  const token = raw.trim().toUpperCase().replace(/[^A-Z0-9]/g,"")
-                   .replace(/^(.{4})(.{4})$/,"$1-$2");
-  const tokenDoc = await getDoc(doc(db,"tokens",token));
-  if (!tokenDoc.exists()) throw new Error("Token not found — check and try again.");
-  const {reimbId} = tokenDoc.data();
-  if ([...myReimbs,...grantedReimbs].some(r=>r.id===reimbId))
-    throw new Error("You already have access to this reimb.");
-  await setDoc(doc(db,"users",user.uid), {grantedReimbs: arrayUnion(reimbId)}, {merge:true});
-  const rd = await getDoc(doc(db,"reimbs",reimbId));
-  if (!rd.exists()) throw new Error("Reimb not found.");
-  const r = {id:rd.id, ...rd.data(), role:"viewer"};
-  grantedReimbs = [r, ...grantedReimbs];
-  openReimb(r);
+  const r = await api('/api/reimbs/join', {
+    method: 'POST',
+    body: JSON.stringify({ token: raw })
+  });
+  if (!reimbsList.some(item => item.id === r.id)) {
+    reimbsList = [r, ...reimbsList];
+  }
+  await openReimb(r);
 }
 
-function openReimb(r) {
+async function openReimb(r) {
   currentReimb = r; screen = "reimb";
-  month = new Date().toISOString().slice(0,7); items = [];
-  if (unsub) { unsub(); unsub = null; }
-  unsub = onSnapshot(
-    query(collection(db,"reimbs",r.id,"expenses"), orderBy("date","desc")),
-    s => { items = s.docs.map(d => ({id:d.id,...d.data()})); render(); },
-    x => { showErr("Can't load: "+x.code); }
-  );
+  month = new Date().toISOString().slice(0,7);
+  render();
+  await loadExpenses();
+}
+
+async function loadExpenses() {
+  if (!currentReimb) return;
+  try {
+    items = await api(`/api/reimbs/${currentReimb.id}/expenses`);
+  } catch (err) {
+    showErr("Can't load expenses: " + err.message);
+  }
   render();
 }
 
 function goBack() {
-  if (unsub) { unsub(); unsub = null; }
   currentReimb = null; items = []; screen = "dash"; render();
 }
 
 // ── Render ──
 function render() {
-  if (!user)                               { renderLogin();  return; }
-  if (screen==="reimb" && currentReimb)   { renderReimb();  return; }
+  if (!user)                             { renderLogin();  return; }
+  if (screen==="reimb" && currentReimb) { renderReimb();  return; }
   renderDash();
 }
 
@@ -208,7 +200,7 @@ function renderLogin() {
   $app.innerHTML = `
     <div class="center">
       <h1>Expense book</h1>
-      <p>Sign in with Google to get started.<br>No setup needed — just your account.</p>
+      <p>Sign in with Google to access your reimbursements.</p>
       <button class="btn pri" id="in">Sign in with Google</button>
     </div>`;
   document.getElementById("in").onclick = () =>
@@ -217,14 +209,13 @@ function renderLogin() {
 }
 
 function renderDash() {
-  const all = [...myReimbs, ...grantedReimbs];
-  const cards = all.map(r => `
+  const cards = reimbsList.map(r => `
     <div class="card" data-id="${r.id}">
       <div class="card-top">
         <span class="card-name">${esc(r.name)}</span>
         <span class="badge${r.role==="viewer"?" view":""}">${r.role==="owner"?"Owner":"Viewer"}</span>
       </div>
-      <div class="card-sub">${esc(r.ownerEmail)}</div>
+      <div class="card-sub">${esc(r.owner_email)}</div>
     </div>`).join("");
 
   $app.innerHTML = `
@@ -244,20 +235,22 @@ function renderDash() {
   document.getElementById("newR").onclick  = () => showSheet("new");
   document.getElementById("joinR").onclick = () => showSheet("join");
   document.querySelectorAll(".card").forEach(c => c.onclick = () => {
-    const r = all.find(r => r.id===c.dataset.id); if (r) openReimb(r);
+    const r = reimbsList.find(r => String(r.id) === String(c.dataset.id));
+    if (r) openReimb(r);
   });
 }
 
 function renderReimb() {
-  const r = currentReimb, isOwner = r.role==="owner";
+  const r = currentReimb, isOwner = r.role === "owner";
   const list  = items.filter(i => i.date && i.date.startsWith(month));
-  const total = list.reduce((a,i) => a+i.amount, 0);
-  const by = {}; list.forEach(i => by[i.category]=(by[i.category]||0)+i.amount);
+  const total = list.reduce((a,i) => a + Number(i.amount), 0);
+  const by = {}; list.forEach(i => by[i.category] = (by[i.category] || 0) + Number(i.amount));
   const max  = Math.max(1, ...Object.values(by));
   const cats = Object.entries(by).sort((a,b)=>b[1]-a[1])
     .map(([c,v]) => `<div class="cat"><span>${esc(c)}</span>
       <div class="bar"><i style="width:${v/max*100}%"></i></div>
       <span>${inr(v)}</span></div>`).join("");
+
   const rows = list.map(i => `
     <div class="item">
       <div>${esc(i.note||i.category)}
@@ -281,7 +274,7 @@ function renderReimb() {
 
   const tokenBox = isOwner ? `
     <div class="token-box">
-      <div class="token-label">Share this token — anyone who enters it can view this reimb:</div>
+      <div class="token-label">Share this token with others for viewer access:</div>
       <div class="token-row">
         <code>${r.token}</code>
         <button class="btn sm" id="cpTok">Copy</button>
@@ -295,7 +288,7 @@ function renderReimb() {
         <h1 style="margin-top:8px">${esc(r.name)}</h1>
         <div class="who">
           <span class="badge${r.role==="viewer"?" view":""}">${isOwner?"Owner":"Viewer"}</span>
-          ${esc(r.ownerEmail)}
+          ${esc(r.owner_email)}
         </div>
       </div>
       <button class="btn" id="out">Sign out</button>
@@ -320,23 +313,36 @@ function renderReimb() {
         if (b) { b.textContent="Copied!"; setTimeout(()=>{ const b2=document.getElementById("cpTok"); if(b2)b2.textContent="Copy"; },2000); }
       });
     };
+
     const f = document.getElementById("f");
     if (f) f.onsubmit = async e => {
-      e.preventDefault(); const d = new FormData(f);
+      e.preventDefault();
+      const d = new FormData(f);
       try {
-        await addDoc(collection(db,"reimbs",r.id,"expenses"), {
-          amount: Number(d.get("amount")), category: d.get("category"),
-          date: d.get("date"), note: d.get("note").trim(),
-          by: user.email, createdAt: serverTimestamp()
-        }); f.reset(); f.date.value=new Date().toLocaleDateString("en-CA");
-      } catch(x) { showErr("Save failed: "+x.code); }
+        const added = await api(`/api/reimbs/${r.id}/expenses`, {
+          method: 'POST',
+          body: JSON.stringify({
+            amount: Number(d.get("amount")),
+            category: d.get("category"),
+            date: d.get("date"),
+            note: d.get("note").trim()
+          })
+        });
+        items.unshift(added);
+        f.reset();
+        f.date.value = new Date().toLocaleDateString("en-CA");
+        render();
+      } catch(x) { showErr("Save failed: " + x.message); }
     };
   }
 
   document.querySelectorAll("[data-del]").forEach(b => b.onclick = async () => {
     if (!confirm("Delete this expense?")) return;
-    try { await deleteDoc(doc(db,"reimbs",r.id,"expenses",b.dataset.del)); }
-    catch(x) { showErr("Delete failed: "+x.code); }
+    try {
+      await api(`/api/expenses/${b.dataset.del}`, { method: 'DELETE' });
+      items = items.filter(it => String(it.id) !== String(b.dataset.del));
+      render();
+    } catch(x) { showErr("Delete failed: " + x.message); }
   });
 }
 
@@ -389,7 +395,6 @@ function showSheet(type) {
 }
 
 function showErr(msg) {
-  // show non-blocking error at top of page for 4s
   let el = document.getElementById("globalErr");
   if (!el) {
     el = document.createElement("div");

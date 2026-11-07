@@ -1,8 +1,16 @@
--- Database schema for PostgreSQL
+-- Pure PostgreSQL Schema (Zero Firebase)
 
 CREATE TABLE IF NOT EXISTS users (
-    uid VARCHAR(128) PRIMARY KEY,
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS login_otps (
+    id SERIAL PRIMARY KEY,
     email VARCHAR(255) NOT NULL,
+    code VARCHAR(6) NOT NULL,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -10,17 +18,17 @@ CREATE TABLE IF NOT EXISTS reimbs (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     token VARCHAR(32) UNIQUE NOT NULL,
-    owner_uid VARCHAR(128) NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    owner_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS reimb_access (
     id SERIAL PRIMARY KEY,
     reimb_id INT NOT NULL REFERENCES reimbs(id) ON DELETE CASCADE,
-    user_uid VARCHAR(128) NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+    user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role VARCHAR(32) DEFAULT 'viewer',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(reimb_id, user_uid)
+    UNIQUE(reimb_id, user_id)
 );
 
 CREATE TABLE IF NOT EXISTS expenses (
@@ -36,3 +44,4 @@ CREATE TABLE IF NOT EXISTS expenses (
 
 CREATE INDEX IF NOT EXISTS idx_reimbs_token ON reimbs(token);
 CREATE INDEX IF NOT EXISTS idx_expenses_reimb_date ON expenses(reimb_id, date DESC);
+CREATE INDEX IF NOT EXISTS idx_otps_email ON login_otps(email);

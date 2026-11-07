@@ -2,11 +2,12 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const { Pool } = require('pg');
-const admin = require('firebase-admin');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'reimbersment-super-secret-key-change-in-prod';
 
 app.use(cors());
 app.use(express.json());
@@ -15,8 +16,8 @@ app.use(express.static(path.join(__dirname)));
 // ── Database Setup ──
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('localhost') 
-    ? { rejectUnauthorized: false } 
+  ssl: process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('localhost')
+    ? { rejectUnauthorized: false }
     : false
 });
 
@@ -26,8 +27,16 @@ async function initDb() {
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
-        uid VARCHAR(128) PRIMARY KEY,
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS login_otps (
+        id SERIAL PRIMARY KEY,
         email VARCHAR(255) NOT NULL,
+        code VARCHAR(6) NOT NULL,
+        expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -35,17 +44,17 @@ async function initDb() {
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         token VARCHAR(32) UNIQUE NOT NULL,
-        owner_uid VARCHAR(128) NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+        owner_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
       CREATE TABLE IF NOT EXISTS reimb_access (
         id SERIAL PRIMARY KEY,
         reimb_id INT NOT NULL REFERENCES reimbs(id) ON DELETE CASCADE,
-        user_uid VARCHAR(128) NOT NULL REFERENCES users(uid) ON DELETE CASCADE,
+        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         role VARCHAR(32) DEFAULT 'viewer',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(reimb_id, user_uid)
+        UNIQUE(reimb_id, user_id)
       );
 
       CREATE TABLE IF NOT EXISTS expenses (
@@ -61,8 +70,9 @@ async function initDb() {
 
       CREATE INDEX IF NOT EXISTS idx_reimbs_token ON reimbs(token);
       CREATE INDEX IF NOT EXISTS idx_expenses_reimb_date ON expenses(reimb_id, date DESC);
+      CREATE INDEX IF NOT EXISTS idx_otps_email ON login_otps(email);
     `);
-    console.log('Database initialized successfully');
+    console.log('PostgreSQL database initialized successfully');
   } catch (err) {
     console.error('Database initialization error:', err);
   } finally {
@@ -70,66 +80,25 @@ async function initDb() {
   }
 }
 
-// ── Firebase Admin Auth Setup ──
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-  } catch (e) {
-    console.warn('Could not parse FIREBASE_SERVICE_ACCOUNT, initializing default app:', e.message);
-    admin.initializeApp();
-  }
-} else {
-  // Uses default credentials or basic token payload check if no cert supplied
-  try {
-    admin.initializeApp();
-  } catch(e) {}
-}
-
-// Auth Middleware: verifies token & upserts user in Postgres
-async function requireAuth(req, res, next) {
+// ── JWT Auth Middleware ──
+function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: Missing or invalid token' });
+    return res.status(401).json({ error: 'Unauthorized: missing token' });
   }
 
-  const idToken = authHeader.split('Bearer ')[1];
+  const token = authHeader.split('Bearer ')[1];
   try {
-    let uid, email;
-    try {
-      const decoded = await admin.auth().verifyIdToken(idToken);
-      uid = decoded.uid;
-      email = decoded.email || '';
-    } catch (fbErr) {
-      // Fallback for decode if service account key isn't configured in development
-      const decodedPayload = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString());
-      uid = decodedPayload.user_id || decodedPayload.sub;
-      email = decodedPayload.email || '';
-    }
-
-    if (!uid) {
-      return res.status(401).json({ error: 'Invalid token payload' });
-    }
-
-    // Upsert user
-    await pool.query(
-      `INSERT INTO users (uid, email) VALUES ($1, $2)
-       ON CONFLICT (uid) DO UPDATE SET email = EXCLUDED.email`,
-      [uid, email]
-    );
-
-    req.user = { uid, email };
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload; // { id, email }
     next();
   } catch (err) {
-    console.error('Auth verification failed:', err);
-    res.status(401).json({ error: 'Authentication failed' });
+    return res.status(401).json({ error: 'Invalid or expired session' });
   }
 }
 
-// Helper to generate token
-function genToken() {
+// Helper: Token Generator
+function genReimbToken() {
   const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let t = "";
   for (let i = 0; i < 8; i++) {
@@ -139,22 +108,105 @@ function genToken() {
   return t;
 }
 
-// ── API Routes ──
+// ── Authentication Endpoints (Pure Postgres OTP) ──
 
-// 1. Get all reimbs (owned + shared)
+// 1. Request OTP Code
+app.post('/api/auth/send-otp', async (req, res) => {
+  try {
+    let { email } = req.body;
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'Please enter a valid email' });
+    }
+    email = email.trim().toLowerCase();
+
+    // Generate 6-digit code
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Store in Postgres
+    await pool.query(
+      `INSERT INTO login_otps (email, code, expires_at) VALUES ($1, $2, $3)`,
+      [email, code, expiresAt]
+    );
+
+    console.log(`[LOGIN OTP] Code for ${email} is: ${code}`);
+
+    // Return the code in response (so user can log in instantly without needing email API configured)
+    res.json({
+      success: true,
+      message: 'OTP generated',
+      code: code // Displayed or used directly
+    });
+  } catch (err) {
+    console.error('Send OTP error:', err);
+    res.status(500).json({ error: 'Failed to send OTP' });
+  }
+});
+
+// 2. Verify OTP and return session JWT
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    let { email, code } = req.body;
+    if (!email || !code) {
+      return res.status(400).json({ error: 'Email and code are required' });
+    }
+    email = email.trim().toLowerCase();
+    code = code.trim();
+
+    // Verify OTP in Postgres
+    const otpRes = await pool.query(
+      `SELECT * FROM login_otps
+       WHERE email = $1 AND code = $2 AND expires_at > NOW()
+       ORDER BY id DESC LIMIT 1`,
+      [email, code]
+    );
+
+    if (otpRes.rows.length === 0) {
+      return res.status(400).json({ error: 'Invalid or expired OTP code' });
+    }
+
+    // Delete used OTPs for this email
+    await pool.query(`DELETE FROM login_otps WHERE email = $1`, [email]);
+
+    // Upsert user in Postgres
+    const userRes = await pool.query(
+      `INSERT INTO users (email) VALUES ($1)
+       ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+       RETURNING id, email`,
+      [email]
+    );
+
+    const user = userRes.rows[0];
+
+    // Issue JWT (valid for 30 days)
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '30d' });
+
+    res.json({
+      token,
+      user: { id: user.id, email: user.email }
+    });
+  } catch (err) {
+    console.error('Verify OTP error:', err);
+    res.status(500).json({ error: 'Verification failed' });
+  }
+});
+
+// ── Application Endpoints ──
+
+// 1. Get user's reimbs
 app.get('/api/reimbs', requireAuth, async (req, res) => {
   try {
-    const { uid } = req.user;
+    const userId = req.user.id;
     const query = `
       SELECT r.id, r.name, r.token, r.created_at, u.email as owner_email,
-        CASE WHEN r.owner_uid = $1 THEN 'owner' ELSE 'viewer' END as role
+        CASE WHEN r.owner_id = $1 THEN 'owner' ELSE 'viewer' END as role
       FROM reimbs r
-      JOIN users u ON r.owner_uid = u.uid
-      LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_uid = $1
-      WHERE r.owner_uid = $1 OR ra.user_uid = $1
+      JOIN users u ON r.owner_id = u.id
+      LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_id = $1
+      WHERE r.owner_id = $1 OR ra.user_id = $1
       ORDER BY r.created_at DESC
     `;
-    const result = await pool.query(query, [uid]);
+    const result = await pool.query(query, [userId]);
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching reimbs:', err);
@@ -169,14 +221,15 @@ app.post('/api/reimbs', requireAuth, async (req, res) => {
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Name is required' });
     }
-    const { uid, email } = req.user;
-    const token = genToken();
+    const userId = req.user.id;
+    const email = req.user.email;
+    const token = genReimbToken();
 
     const insertResult = await pool.query(
-      `INSERT INTO reimbs (name, token, owner_uid)
+      `INSERT INTO reimbs (name, token, owner_id)
        VALUES ($1, $2, $3)
        RETURNING id, name, token, created_at`,
-      [name.trim(), token, uid]
+      [name.trim(), token, userId]
     );
 
     const created = insertResult.rows[0];
@@ -200,9 +253,9 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
     token = token.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^(.{4})(.{4})$/, '$1-$2');
 
     const reimbQuery = await pool.query(
-      `SELECT r.id, r.name, r.token, r.owner_uid, u.email as owner_email
+      `SELECT r.id, r.name, r.token, r.owner_id, u.email as owner_email
        FROM reimbs r
-       JOIN users u ON r.owner_uid = u.uid
+       JOIN users u ON r.owner_id = u.id
        WHERE r.token = $1`,
       [token]
     );
@@ -212,18 +265,17 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
     }
 
     const reimb = reimbQuery.rows[0];
-    const { uid } = req.user;
+    const userId = req.user.id;
 
-    if (reimb.owner_uid === uid) {
+    if (reimb.owner_id === userId) {
       return res.status(400).json({ error: 'You are already the owner of this reimb' });
     }
 
-    // Insert access permission
     await pool.query(
-      `INSERT INTO reimb_access (reimb_id, user_uid, role)
+      `INSERT INTO reimb_access (reimb_id, user_id, role)
        VALUES ($1, $2, 'viewer')
-       ON CONFLICT (reimb_id, user_uid) DO NOTHING`,
-      [reimb.id, uid]
+       ON CONFLICT (reimb_id, user_id) DO NOTHING`,
+      [reimb.id, userId]
     );
 
     res.json({
@@ -243,14 +295,13 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
 app.get('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
   try {
     const reimbId = parseInt(req.params.id, 10);
-    const { uid } = req.user;
+    const userId = req.user.id;
 
-    // Check permission
     const accessCheck = await pool.query(
       `SELECT r.id FROM reimbs r
-       LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_uid = $2
-       WHERE r.id = $1 AND (r.owner_uid = $2 OR ra.user_uid = $2)`,
-      [reimbId, uid]
+       LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_id = $2
+       WHERE r.id = $1 AND (r.owner_id = $2 OR ra.user_id = $2)`,
+      [reimbId, userId]
     );
 
     if (accessCheck.rows.length === 0) {
@@ -277,16 +328,16 @@ app.post('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
   try {
     const reimbId = parseInt(req.params.id, 10);
     const { amount, category, date, note } = req.body;
-    const { uid, email } = req.user;
+    const userId = req.user.id;
+    const email = req.user.email;
 
-    if (!amount || isNaN(amount) || amount <= 0 || !category || !date) {
+    if (!amount || isNaN(amount) || Number(amount) <= 0 || !category || !date) {
       return res.status(400).json({ error: 'Missing or invalid fields' });
     }
 
-    // Verify owner
     const ownerCheck = await pool.query(
-      `SELECT id FROM reimbs WHERE id = $1 AND owner_uid = $2`,
-      [reimbId, uid]
+      `SELECT id FROM reimbs WHERE id = $1 AND owner_id = $2`,
+      [reimbId, userId]
     );
     if (ownerCheck.rows.length === 0) {
       return res.status(403).json({ error: 'Only the owner can add expenses' });
@@ -310,13 +361,13 @@ app.post('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
 app.delete('/api/expenses/:id', requireAuth, async (req, res) => {
   try {
     const expenseId = parseInt(req.params.id, 10);
-    const { uid } = req.user;
+    const userId = req.user.id;
 
     const deleteResult = await pool.query(
       `DELETE FROM expenses
-       WHERE id = $1 AND reimb_id IN (SELECT id FROM reimbs WHERE owner_uid = $2)
+       WHERE id = $1 AND reimb_id IN (SELECT id FROM reimbs WHERE owner_id = $2)
        RETURNING id`,
-      [expenseId, uid]
+      [expenseId, userId]
     );
 
     if (deleteResult.rowCount === 0) {

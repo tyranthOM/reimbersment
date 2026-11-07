@@ -22,8 +22,13 @@ header{display:flex;justify-content:space-between;align-items:flex-start;gap:10p
 .who{color:var(--mut);font-size:12.5px;margin-top:3px}
 .badge{display:inline-block;padding:1px 8px;border-radius:10px;background:var(--ac);color:var(--acink);font-weight:600;font-size:12px}
 .badge.view{background:var(--ln);color:var(--ink)}
-.center{text-align:center;padding:90px 10px}
+.center{text-align:center;padding:70px 10px}
 .center p{color:var(--mut)}
+
+/* Auth Form */
+.auth-box{background:var(--sf);border:1px solid var(--ln);border-radius:12px;padding:24px 20px;max-width:380px;margin:24px auto 0;text-align:left}
+.auth-box label{display:block;font-size:13px;font-weight:600;margin-bottom:6px;color:var(--mut)}
+.auth-box input{margin-bottom:12px}
 
 /* Dashboard */
 .dash-actions{display:flex;gap:8px;margin:20px 0 16px}
@@ -52,6 +57,7 @@ input:focus,select:focus{outline:2px solid var(--ac)}
 .x{border:0;background:none;color:var(--bad);font-size:20px;padding:4px 8px}
 .empty{color:var(--mut);padding:20px 0;text-align:center}
 .err{color:var(--bad);font-size:13px;margin-top:8px;padding:8px;background:rgba(179,38,30,.08);border-radius:6px}
+.info{color:var(--ac);font-size:13px;margin-top:8px;padding:8px;background:rgba(31,111,92,.1);border-radius:6px}
 
 /* Token share box */
 .token-box{background:var(--sf);border:1px solid var(--ln);border-radius:10px;padding:14px 16px;margin:14px 0}
@@ -73,76 +79,77 @@ code{font-size:22px;font-weight:800;letter-spacing:3px;background:var(--bg);padd
 <body>
 <div class="wrap" id="app"></div>
 <div id="modal"></div>
-<script type="module">
-import {initializeApp} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import {getAuth,GoogleAuthProvider,signInWithPopup,signOut,onAuthStateChanged}
-  from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
-const firebaseConfig = {
-  apiKey:            "AIzaSyAXSCZ2Wqv3Jw6diMNhX9KUMA3BWFgq_PI",
-  authDomain:        "reimbursement-a31af.firebaseapp.com",
-  projectId:         "reimbursement-a31af",
-  storageBucket:     "reimbursement-a31af.firebasestorage.app",
-  messagingSenderId: "745043038117",
-  appId:             "1:745043038117:web:a0dd8aa3b22eda3355224c"
-};
-
-const app  = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const $app   = document.getElementById("app");
+<script>
+const $app = document.getElementById("app");
 const $modal = document.getElementById("modal");
 
 const CATS = ["Food","Travel","Study","Fun","Shopping","Other"];
 
-// ── State ──
-let user = null, screen = "dash";
+// ── App State (Pure Postgres + JWT) ──
+let currentUser = JSON.parse(localStorage.getItem("reimb_user") || "null");
+let authToken = localStorage.getItem("reimb_token") || null;
+let screen = "dash";
+let authStep = "email"; // 'email' or 'otp'
+let tempEmail = "";
+
 let reimbsList = [];
 let currentReimb = null, items = [];
-let month  = new Date().toISOString().slice(0,7);
+let month = new Date().toISOString().slice(0,7);
 let loading = false;
 
 // ── Helpers ──
 const esc = s => String(s || "").replace(/[&<>"']/g, c =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const inr   = n => "₹" + Math.round(Number(n)).toLocaleString("en-IN");
+const inr = n => "₹" + Math.round(Number(n)).toLocaleString("en-IN");
 const shift = (m,d) => { const [y,mo] = m.split("-").map(Number);
   const dt = new Date(y, mo-1+d, 1);
   return dt.getFullYear()+"-"+String(dt.getMonth()+1).padStart(2,"0"); };
 const label = m => { const [y,mo] = m.split("-").map(Number);
   return new Date(y,mo-1,1).toLocaleDateString("en-IN",{month:"long",year:"numeric"}); };
 
-// API Fetch Helper with Firebase Token
+// API Fetch Helper
 async function api(path, options = {}) {
-  if (!user) throw new Error("Not logged in");
-  const token = await user.getIdToken();
   const headers = {
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${token}`,
+    ...(authToken ? { 'Authorization': `Bearer ${authToken}` } : {}),
     ...(options.headers || {})
   };
 
   const res = await fetch(path, { ...options, headers });
   const data = await res.json().catch(() => ({}));
+
+  if (res.status === 401) {
+    // Session expired
+    signOut();
+    throw new Error("Session expired. Please log in again.");
+  }
+
   if (!res.ok) {
     throw new Error(data.error || `HTTP error ${res.status}`);
   }
   return data;
 }
 
-// ── Auth ──
-onAuthStateChanged(auth, async u => {
-  user = u; items = []; currentReimb = null; screen = "dash";
-  if (u) await loadDashboard();
+function signOut() {
+  localStorage.removeItem("reimb_token");
+  localStorage.removeItem("reimb_user");
+  currentUser = null;
+  authToken = null;
+  currentReimb = null;
+  reimbsList = [];
+  authStep = "email";
   render();
-});
+}
 
-// ── Data (from PostgreSQL via API) ──
+// ── Data Loading ──
 async function loadDashboard() {
+  if (!currentUser) return;
   loading = true; render();
   try {
     reimbsList = await api('/api/reimbs');
   } catch (err) {
-    showErr("Error loading reimbs: " + err.message);
+    showErr(err.message);
   } finally {
     loading = false; render();
   }
@@ -189,23 +196,94 @@ function goBack() {
   currentReimb = null; items = []; screen = "dash"; render();
 }
 
-// ── Render ──
+// ── Render Views ──
 function render() {
-  if (!user)                             { renderLogin();  return; }
-  if (screen==="reimb" && currentReimb) { renderReimb();  return; }
+  if (!currentUser)                     { renderLogin(); return; }
+  if (screen==="reimb" && currentReimb) { renderReimb(); return; }
   renderDash();
 }
 
 function renderLogin() {
-  $app.innerHTML = `
-    <div class="center">
-      <h1>Expense book</h1>
-      <p>Sign in with Google to access your reimbursements.</p>
-      <button class="btn pri" id="in">Sign in with Google</button>
-    </div>`;
-  document.getElementById("in").onclick = () =>
-    signInWithPopup(auth, new GoogleAuthProvider())
-      .catch(x => showErr(x.code));
+  if (authStep === "email") {
+    $app.innerHTML = `
+      <div class="center">
+        <h1>Expense book</h1>
+        <p>Pure PostgreSQL expense tracker. Access from any device.</p>
+        <div class="auth-box">
+          <label>Your Email Address</label>
+          <input id="loginEmail" type="email" placeholder="e.g. name@example.com" value="${esc(tempEmail)}">
+          <button class="btn pri full" id="sendOtpBtn" style="width:100%">Get Login Code</button>
+          <div id="loginMsg"></div>
+        </div>
+      </div>`;
+
+    document.getElementById("sendOtpBtn").onclick = async () => {
+      const email = document.getElementById("loginEmail").value.trim();
+      const msg = document.getElementById("loginMsg");
+      if (!email || !email.includes("@")) {
+        msg.innerHTML = `<div class="err">Please enter a valid email address.</div>`;
+        return;
+      }
+      msg.innerHTML = `<div class="info">Generating code...</div>`;
+      try {
+        const res = await api('/api/auth/send-otp', {
+          method: 'POST',
+          body: JSON.stringify({ email })
+        });
+        tempEmail = email;
+        authStep = "otp";
+        render();
+        // Show the code directly in helper box for convenience
+        setTimeout(() => {
+          showErr(`Your login code is: ${res.code}`);
+        }, 500);
+      } catch (err) {
+        msg.innerHTML = `<div class="err">${esc(err.message)}</div>`;
+      }
+    };
+  } else {
+    $app.innerHTML = `
+      <div class="center">
+        <h1>Enter Login Code</h1>
+        <p>Code sent for <b>${esc(tempEmail)}</b></p>
+        <div class="auth-box">
+          <label>6-Digit Code</label>
+          <input id="otpCode" type="text" maxlength="6" inputmode="numeric" placeholder="123456" autofocus>
+          <button class="btn pri full" id="verifyOtpBtn" style="width:100%">Sign In</button>
+          <button class="btn sm" id="backToEmail" style="width:100%;margin-top:8px">Use different email</button>
+          <div id="loginMsg"></div>
+        </div>
+      </div>`;
+
+    document.getElementById("backToEmail").onclick = () => {
+      authStep = "email"; render();
+    };
+
+    document.getElementById("verifyOtpBtn").onclick = async () => {
+      const code = document.getElementById("otpCode").value.trim();
+      const msg = document.getElementById("loginMsg");
+      if (!code || code.length < 4) {
+        msg.innerHTML = `<div class="err">Please enter the 6-digit code.</div>`;
+        return;
+      }
+      msg.innerHTML = `<div class="info">Verifying...</div>`;
+      try {
+        const res = await api('/api/auth/verify-otp', {
+          method: 'POST',
+          body: JSON.stringify({ email: tempEmail, code })
+        });
+        authToken = res.token;
+        currentUser = res.user;
+        localStorage.setItem("reimb_token", authToken);
+        localStorage.setItem("reimb_user", JSON.stringify(currentUser));
+        authStep = "email";
+        tempEmail = "";
+        await loadDashboard();
+      } catch (err) {
+        msg.innerHTML = `<div class="err">${esc(err.message)}</div>`;
+      }
+    };
+  }
 }
 
 function renderDash() {
@@ -220,7 +298,7 @@ function renderDash() {
 
   $app.innerHTML = `
     <header>
-      <div><h1>Expense book</h1><div class="who">${esc(user.email)}</div></div>
+      <div><h1>Expense book</h1><div class="who">${esc(currentUser.email)}</div></div>
       <button class="btn" id="out">Sign out</button>
     </header>
     <div class="dash-actions">
@@ -231,8 +309,8 @@ function renderDash() {
       ? `<div class="empty">Loading…</div>`
       : cards || `<div class="empty">No reimbs yet.<br>Create one or join with a token!</div>`}`;
 
-  document.getElementById("out").onclick  = () => signOut(auth);
-  document.getElementById("newR").onclick  = () => showSheet("new");
+  document.getElementById("out").onclick = signOut;
+  document.getElementById("newR").onclick = () => showSheet("new");
   document.getElementById("joinR").onclick = () => showSheet("join");
   document.querySelectorAll(".card").forEach(c => c.onclick = () => {
     const r = reimbsList.find(r => String(r.id) === String(c.dataset.id));
@@ -242,10 +320,10 @@ function renderDash() {
 
 function renderReimb() {
   const r = currentReimb, isOwner = r.role === "owner";
-  const list  = items.filter(i => i.date && i.date.startsWith(month));
+  const list = items.filter(i => i.date && i.date.startsWith(month));
   const total = list.reduce((a,i) => a + Number(i.amount), 0);
   const by = {}; list.forEach(i => by[i.category] = (by[i.category] || 0) + Number(i.amount));
-  const max  = Math.max(1, ...Object.values(by));
+  const max = Math.max(1, ...Object.values(by));
   const cats = Object.entries(by).sort((a,b)=>b[1]-a[1])
     .map(([c,v]) => `<div class="cat"><span>${esc(c)}</span>
       <div class="bar"><i style="width:${v/max*100}%"></i></div>
@@ -302,9 +380,9 @@ function renderReimb() {
     ${rows || `<div class="empty">No expenses this month.</div>`}`;
 
   document.getElementById("back").onclick = goBack;
-  document.getElementById("out").onclick  = () => signOut(auth);
-  document.getElementById("pv").onclick   = () => { month=shift(month,-1); render(); };
-  document.getElementById("nx").onclick   = () => { month=shift(month, 1); render(); };
+  document.getElementById("out").onclick = signOut;
+  document.getElementById("pv").onclick = () => { month=shift(month,-1); render(); };
+  document.getElementById("nx").onclick = () => { month=shift(month, 1); render(); };
 
   if (isOwner) {
     document.getElementById("cpTok").onclick = () => {
@@ -346,7 +424,7 @@ function renderReimb() {
   });
 }
 
-// ── Bottom sheet (create / join) ──
+// ── Modal Sheet ──
 function showSheet(type) {
   const isNew = type === "new";
   $modal.innerHTML = `
@@ -365,9 +443,9 @@ function showSheet(type) {
       </div>
     </div>`;
 
-  const inp  = document.getElementById("shInp");
-  const btn  = document.getElementById("shOk");
-  const errEl= document.getElementById("shErr");
+  const inp = document.getElementById("shInp");
+  const btn = document.getElementById("shOk");
+  const errEl = document.getElementById("shErr");
   inp.focus();
 
   const close = () => { $modal.innerHTML = ""; };
@@ -384,10 +462,10 @@ function showSheet(type) {
     errEl.innerHTML = "";
     try {
       if (isNew) await createReimb(val);
-      else       await joinWithToken(val);
+      else await joinWithToken(val);
       close();
     } catch(e) {
-      errEl.innerHTML = `<div class="err">${esc(e.message||e.code)}</div>`;
+      errEl.innerHTML = `<div class="err">${esc(e.message)}</div>`;
       btn.disabled = false;
       btn.textContent = isNew ? "Create" : "Join";
     }
@@ -405,6 +483,13 @@ function showErr(msg) {
   el.textContent = msg;
   clearTimeout(el._t);
   el._t = setTimeout(() => el.remove(), 4000);
+}
+
+// Initial boot
+if (currentUser && authToken) {
+  loadDashboard();
+} else {
+  render();
 }
 </script>
 </body>

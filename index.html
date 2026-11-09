@@ -5,8 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Expense book</title>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;800&display=swap" rel="stylesheet">
-<!-- Google Identity Services (OAuth 2.0) -->
-<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 :root{--bg:#eef1f0;--sf:#fff;--ink:#17201d;--mut:#62716b;--ln:#d2dbd7;--ac:#1f6f5c;--acink:#fff;--bad:#b3261e;
 padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
@@ -27,9 +25,10 @@ header{display:flex;justify-content:space-between;align-items:flex-start;gap:10p
 .center{text-align:center;padding:70px 10px}
 .center p{color:var(--mut)}
 
-/* Google Sign-in Container */
-.oauth-card{background:var(--sf);border:1px solid var(--ln);border-radius:12px;padding:28px 20px;max-width:380px;margin:24px auto 0;text-align:center}
-#googleBtnContainer{display:flex;justify-content:center;margin:18px 0 10px}
+/* Auth Box */
+.auth-box{background:var(--sf);border:1px solid var(--ln);border-radius:12px;padding:24px 20px;max-width:380px;margin:24px auto 0;text-align:left}
+.auth-box label{display:block;font-size:13px;font-weight:600;margin-bottom:6px;color:var(--mut)}
+.auth-box input{margin-bottom:12px}
 
 /* Dashboard */
 .dash-actions{display:flex;gap:8px;margin:20px 0 16px}
@@ -87,10 +86,7 @@ const $modal = document.getElementById("modal");
 
 const CATS = ["Food","Travel","Study","Fun","Shopping","Other"];
 
-// Google OAuth Client ID (from your Google Cloud project)
-const GOOGLE_CLIENT_ID = "745043038117-09s99f06qf7p0v613j0f11s5g5197dfl.apps.googleusercontent.com"; // Standard client or your ID
-
-// ── App State (Pure Postgres + JWT) ──
+// ── App State (Pure PostgreSQL on Render + JWT) ──
 const API_BASE = window.location.hostname.includes("onrender.com") || window.location.hostname === "localhost" 
   ? "" 
   : "https://reimbersment.onrender.com";
@@ -145,27 +141,6 @@ function signOut() {
   currentReimb = null;
   reimbsList = [];
   render();
-}
-
-// ── Google OAuth Callback Handler ──
-async function handleGoogleCredential(response) {
-  const msgEl = document.getElementById("loginMsg");
-  if (msgEl) msgEl.innerHTML = `<div class="info">Authenticating with PostgreSQL...</div>`;
-  
-  try {
-    const res = await api('/api/auth/google', {
-      method: 'POST',
-      body: JSON.stringify({ credential: response.credential })
-    });
-
-    authToken = res.token;
-    currentUser = res.user;
-    localStorage.setItem("reimb_token", authToken);
-    localStorage.setItem("reimb_user", JSON.stringify(currentUser));
-    await loadDashboard();
-  } catch (err) {
-    if (msgEl) msgEl.innerHTML = `<div class="err">${esc(err.message)}</div>`;
-  }
 }
 
 // ── Data Loading ──
@@ -233,31 +208,47 @@ function renderLogin() {
   $app.innerHTML = `
     <div class="center">
       <h1>Expense book</h1>
-      <p>PostgreSQL expense tracker. Sign in from any device.</p>
-      <div class="oauth-card">
-        <label style="display:block;font-size:14px;font-weight:600;margin-bottom:12px">Sign in with Google</label>
-        <div id="googleBtnContainer"></div>
-        <div id="loginMsg" style="margin-top:12px"></div>
+      <p>Render PostgreSQL expense tracker.<br>Access & sync from any account or device.</p>
+      <div class="auth-box">
+        <label>Enter your email to continue</label>
+        <input id="loginEmail" type="email" placeholder="e.g. ombhalerao118@gmail.com" autofocus>
+        <button class="btn pri full" id="loginBtn" style="width:100%">Continue</button>
+        <div id="loginMsg"></div>
       </div>
     </div>`;
 
-  // Initialize Google One Tap / Button
-  function setupGoogle() {
-    if (window.google && window.google.accounts) {
-      window.google.accounts.id.initialize({
-        client_id: GOOGLE_CLIENT_ID,
-        callback: handleGoogleCredential,
-        auto_select: false
-      });
-      window.google.accounts.id.renderButton(
-        document.getElementById("googleBtnContainer"),
-        { theme: "outline", size: "large", shape: "pill", width: 280 }
-      );
-    } else {
-      setTimeout(setupGoogle, 200);
+  const input = document.getElementById("loginEmail");
+  const btn = document.getElementById("loginBtn");
+  const msg = document.getElementById("loginMsg");
+
+  input.onkeydown = e => { if (e.key === "Enter") btn.click(); };
+
+  btn.onclick = async () => {
+    const email = input.value.trim();
+    if (!email || !email.includes("@")) {
+      msg.innerHTML = `<div class="err">Please enter a valid email address.</div>`;
+      return;
     }
-  }
-  setupGoogle();
+    btn.disabled = true;
+    btn.textContent = "Connecting to PostgreSQL...";
+    msg.innerHTML = "";
+
+    try {
+      const res = await api('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email })
+      });
+      authToken = res.token;
+      currentUser = res.user;
+      localStorage.setItem("reimb_token", authToken);
+      localStorage.setItem("reimb_user", JSON.stringify(currentUser));
+      await loadDashboard();
+    } catch (err) {
+      msg.innerHTML = `<div class="err">${esc(err.message)}</div>`;
+      btn.disabled = false;
+      btn.textContent = "Continue";
+    }
+  };
 }
 
 function renderDash() {
@@ -281,7 +272,7 @@ function renderDash() {
     </div>
     ${loading
       ? `<div class="empty">Loading…</div>`
-      : cards || `<div class="empty">No reimbs yet.<br>Create one or join with a token!</div>`}`;
+      : cards || `<div class="empty">No reimbs yet.<br>Create one or join someone's reimb with a token!</div>`}`;
 
   document.getElementById("out").onclick = signOut;
   document.getElementById("newR").onclick = () => showSheet("new");
@@ -324,14 +315,14 @@ function renderReimb() {
       <button class="btn pri full" type="submit">Add expense</button>
     </form>` : "";
 
-  const tokenBox = isOwner ? `
+  const tokenBox = `
     <div class="token-box">
-      <div class="token-label">Share this token with others for viewer access:</div>
+      <div class="token-label">Share this token so other accounts can view this reimb:</div>
       <div class="token-row">
         <code>${r.token}</code>
         <button class="btn sm" id="cpTok">Copy</button>
       </div>
-    </div>` : "";
+    </div>`;
 
   $app.innerHTML = `
     <header>
@@ -358,14 +349,14 @@ function renderReimb() {
   document.getElementById("pv").onclick = () => { month=shift(month,-1); render(); };
   document.getElementById("nx").onclick = () => { month=shift(month, 1); render(); };
 
-  if (isOwner) {
-    document.getElementById("cpTok").onclick = () => {
-      navigator.clipboard.writeText(r.token).then(() => {
-        const b = document.getElementById("cpTok");
-        if (b) { b.textContent="Copied!"; setTimeout(()=>{ const b2=document.getElementById("cpTok"); if(b2)b2.textContent="Copy"; },2000); }
-      });
-    };
+  document.getElementById("cpTok").onclick = () => {
+    navigator.clipboard.writeText(r.token).then(() => {
+      const b = document.getElementById("cpTok");
+      if (b) { b.textContent="Copied!"; setTimeout(()=>{ const b2=document.getElementById("cpTok"); if(b2)b2.textContent="Copy"; },2000); }
+    });
+  };
 
+  if (isOwner) {
     const f = document.getElementById("f");
     if (f) f.onsubmit = async e => {
       e.preventDefault();
@@ -407,7 +398,7 @@ function showSheet(type) {
         <h2>${isNew ? "Create a new reimb" : "Join with a token"}</h2>
         <input id="shInp" class="sheet-input"
           placeholder="${isNew
-            ? "Name it (e.g. Trip to Goa, Monthly expenses)"
+            ? "Name it (e.g. Goa Trip, Office Expenses)"
             : "Enter token (e.g. ABCD-1234)"}" autocomplete="off">
         <div id="shErr"></div>
         <div class="sheet-actions">

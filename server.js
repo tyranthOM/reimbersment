@@ -3,21 +3,17 @@ const cors = require('cors');
 const path = require('path');
 const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
-const { OAuth2Client } = require('google-auth-library');
 require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'reimbersment-super-secret-key-change-in-prod';
-const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '745043038117-web'; // Or standard client ID
-
-const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname)));
 
-// ── Database Setup ──
+// ── PostgreSQL Connection on Render ──
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL && !process.env.DATABASE_URL.includes('localhost')
@@ -25,7 +21,7 @@ const pool = new Pool({
     : false
 });
 
-// Initialize database tables
+// Auto-initialize schema in PostgreSQL
 async function initDb() {
   const client = await pool.connect();
   try {
@@ -33,7 +29,6 @@ async function initDb() {
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         email VARCHAR(255) UNIQUE NOT NULL,
-        name VARCHAR(255),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -68,7 +63,7 @@ async function initDb() {
       CREATE INDEX IF NOT EXISTS idx_reimbs_token ON reimbs(token);
       CREATE INDEX IF NOT EXISTS idx_expenses_reimb_date ON expenses(reimb_id, date DESC);
     `);
-    console.log('PostgreSQL database initialized successfully');
+    console.log('PostgreSQL database on Render initialized successfully');
   } catch (err) {
     console.error('Database initialization error:', err);
   } finally {
@@ -76,7 +71,7 @@ async function initDb() {
   }
 }
 
-// ── JWT Auth Middleware ──
+// ── Auth Middleware ──
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -86,14 +81,14 @@ function requireAuth(req, res, next) {
   const token = authHeader.split('Bearer ')[1];
   try {
     const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload; // { id, email, name }
+    req.user = payload; // { id, email }
     next();
   } catch (err) {
-    return res.status(401).json({ error: 'Invalid or expired session' });
+    return res.status(401).json({ error: 'Session expired. Please log in again.' });
   }
 }
 
-// Helper: Token Generator
+// Helper: Token Generator (e.g. ABCD-1234)
 function genReimbToken() {
   const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let t = "";
@@ -104,64 +99,43 @@ function genReimbToken() {
   return t;
 }
 
-// ── Google OAuth 2.0 Authentication ──
-app.post('/api/auth/google', async (req, res) => {
+// ── Simple Email Login (No OAuth / No OTP) ──
+app.post('/api/auth/login', async (req, res) => {
   try {
-    const { credential } = req.body;
-    if (!credential) {
-      return res.status(400).json({ error: 'Missing Google credential token' });
+    let { email } = req.body;
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'Please enter a valid email address' });
     }
-
-    let payload;
-    try {
-      // Verify Google token cryptographically
-      const ticket = await googleClient.verifyIdToken({
-        idToken: credential,
-        audience: process.env.GOOGLE_CLIENT_ID || undefined
-      });
-      payload = ticket.getPayload();
-    } catch (vErr) {
-      // Decode fallback if CLIENT_ID is still being configured in environment
-      console.warn('Google verify warning (using decode fallback):', vErr.message);
-      payload = JSON.parse(Buffer.from(credential.split('.')[1], 'base64').toString());
-    }
-
-    const email = (payload.email || '').toLowerCase().trim();
-    const name = payload.name || payload.email.split('@')[0];
-
-    if (!email) {
-      return res.status(400).json({ error: 'Unable to retrieve email from Google token' });
-    }
+    email = email.trim().toLowerCase();
 
     // Upsert user into PostgreSQL
     const userRes = await pool.query(
-      `INSERT INTO users (email, name)
-       VALUES ($1, $2)
-       ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
-       RETURNING id, email, name`,
-      [email, name]
+      `INSERT INTO users (email) VALUES ($1)
+       ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+       RETURNING id, email`,
+      [email]
     );
 
     const user = userRes.rows[0];
 
-    // Issue 30-day JWT session
-    const token = jwt.sign({ id: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '30d' });
+    // Issue JWT session token (valid for 60 days)
+    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '60d' });
 
-    console.log(`[AUTH] User signed in via Google OAuth 2.0: ${user.email} (ID: ${user.id})`);
+    console.log(`[AUTH] User logged in: ${user.email} (ID: ${user.id})`);
 
     res.json({
       token,
-      user: { id: user.id, email: user.email, name: user.name }
+      user: { id: user.id, email: user.email }
     });
   } catch (err) {
-    console.error('Google OAuth error:', err);
-    res.status(500).json({ error: 'Google sign-in verification failed' });
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Authentication failed' });
   }
 });
 
-// ── Application Endpoints ──
+// ── Application Endpoints (PostgreSQL) ──
 
-// 1. Get user's reimbs
+// 1. Get all reimbs for user (owned + shared via token)
 app.get('/api/reimbs', requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -182,7 +156,7 @@ app.get('/api/reimbs', requireAuth, async (req, res) => {
   }
 });
 
-// 2. Create reimb
+// 2. Create reimb (owner gets a token to share)
 app.post('/api/reimbs', requireAuth, async (req, res) => {
   try {
     const { name } = req.body;
@@ -212,7 +186,7 @@ app.post('/api/reimbs', requireAuth, async (req, res) => {
   }
 });
 
-// 3. Join reimb with token
+// 3. Join reimb using token (viewer account connects to same reimb)
 app.post('/api/reimbs/join', requireAuth, async (req, res) => {
   try {
     let { token } = req.body;
@@ -229,14 +203,14 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
     );
 
     if (reimbQuery.rows.length === 0) {
-      return res.status(404).json({ error: 'Token not found' });
+      return res.status(404).json({ error: 'Invalid token — no reimb found with this code' });
     }
 
     const reimb = reimbQuery.rows[0];
     const userId = req.user.id;
 
     if (reimb.owner_id === userId) {
-      return res.status(400).json({ error: 'You are already the owner of this reimb' });
+      return res.status(400).json({ error: 'You are the owner of this reimb' });
     }
 
     await pool.query(
@@ -259,12 +233,13 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
   }
 });
 
-// 4. Get expenses for a reimb
+// 4. Get expenses for a reimb (both accounts fetch this!)
 app.get('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
   try {
     const reimbId = parseInt(req.params.id, 10);
     const userId = req.user.id;
 
+    // Check permission (owner or viewer)
     const accessCheck = await pool.query(
       `SELECT r.id FROM reimbs r
        LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_id = $2

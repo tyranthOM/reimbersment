@@ -1,7 +1,7 @@
 {
   "name": "reimbersment",
   "version": "1.0.0",
-  "description": "Personal expense tracker with PostgreSQL & Google OAuth 2.0",
+  "description": "Personal expense tracker with PostgreSQL backend and token-based sharing",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,6 @@
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "google-auth-library": "^9.14.1",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.12.0"
   }

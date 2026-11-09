@@ -25,6 +25,7 @@ const pool = new Pool({
 async function initDb() {
   const client = await pool.connect();
   try {
+    // Drop old incompatible tables if any, or safely alter columns
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -32,21 +33,30 @@ async function initDb() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
+      -- In case users table was created previously with 'uid' instead of 'id'
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='uid') THEN
+          ALTER TABLE users ALTER COLUMN uid DROP NOT NULL;
+        END IF;
+      END $$;
+
       CREATE TABLE IF NOT EXISTS reimbs (
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         token VARCHAR(32) UNIQUE NOT NULL,
-        owner_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        owner_id INT,
+        owner_email VARCHAR(255),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
       CREATE TABLE IF NOT EXISTS reimb_access (
         id SERIAL PRIMARY KEY,
         reimb_id INT NOT NULL REFERENCES reimbs(id) ON DELETE CASCADE,
-        user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        user_id INT,
+        user_email VARCHAR(255),
         role VARCHAR(32) DEFAULT 'viewer',
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(reimb_id, user_id)
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
 
       CREATE TABLE IF NOT EXISTS expenses (
@@ -108,28 +118,34 @@ app.post('/api/auth/login', async (req, res) => {
     }
     email = email.trim().toLowerCase();
 
-    // Upsert user into PostgreSQL
-    const userRes = await pool.query(
-      `INSERT INTO users (email) VALUES ($1)
-       ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
-       RETURNING id, email`,
-      [email]
-    );
+    // Check if user exists, else insert
+    let userQuery = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
+    let user;
+    if (userQuery.rows.length === 0) {
+      // Create user
+      const insertUser = await pool.query(
+        `INSERT INTO users (email) VALUES ($1) RETURNING *`,
+        [email]
+      );
+      user = insertUser.rows[0];
+    } else {
+      user = userQuery.rows[0];
+    }
 
-    const user = userRes.rows[0];
+    const userId = user.id || user.uid || email;
 
     // Issue JWT session token (valid for 60 days)
-    const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET, { expiresIn: '60d' });
+    const token = jwt.sign({ id: userId, email: user.email }, JWT_SECRET, { expiresIn: '60d' });
 
-    console.log(`[AUTH] User logged in: ${user.email} (ID: ${user.id})`);
+    console.log(`[AUTH] User logged in: ${user.email} (ID: ${userId})`);
 
     res.json({
       token,
-      user: { id: user.id, email: user.email }
+      user: { id: userId, email: user.email }
     });
   } catch (err) {
     console.error('Login error:', err);
-    res.status(500).json({ error: 'Authentication failed' });
+    res.status(500).json({ error: 'Database error: ' + (err.message || 'Unknown error') });
   }
 });
 
@@ -138,21 +154,20 @@ app.post('/api/auth/login', async (req, res) => {
 // 1. Get all reimbs for user (owned + shared via token)
 app.get('/api/reimbs', requireAuth, async (req, res) => {
   try {
-    const userId = req.user.id;
+    const email = req.user.email;
     const query = `
-      SELECT r.id, r.name, r.token, r.created_at, u.email as owner_email,
-        CASE WHEN r.owner_id = $1 THEN 'owner' ELSE 'viewer' END as role
+      SELECT r.id, r.name, r.token, r.created_at, r.owner_email,
+        CASE WHEN r.owner_email = $1 THEN 'owner' ELSE 'viewer' END as role
       FROM reimbs r
-      JOIN users u ON r.owner_id = u.id
-      LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_id = $1
-      WHERE r.owner_id = $1 OR ra.user_id = $1
+      LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_email = $1
+      WHERE r.owner_email = $1 OR ra.user_email = $1
       ORDER BY r.created_at DESC
     `;
-    const result = await pool.query(query, [userId]);
+    const result = await pool.query(query, [email]);
     res.json(result.rows);
   } catch (err) {
     console.error('Error fetching reimbs:', err);
-    res.status(500).json({ error: 'Failed to fetch reimbs' });
+    res.status(500).json({ error: 'Failed to fetch reimbs: ' + err.message });
   }
 });
 
@@ -163,26 +178,24 @@ app.post('/api/reimbs', requireAuth, async (req, res) => {
     if (!name || !name.trim()) {
       return res.status(400).json({ error: 'Name is required' });
     }
-    const userId = req.user.id;
     const email = req.user.email;
     const token = genReimbToken();
 
     const insertResult = await pool.query(
-      `INSERT INTO reimbs (name, token, owner_id)
+      `INSERT INTO reimbs (name, token, owner_email)
        VALUES ($1, $2, $3)
-       RETURNING id, name, token, created_at`,
-      [name.trim(), token, userId]
+       RETURNING id, name, token, created_at, owner_email`,
+      [name.trim(), token, email]
     );
 
     const created = insertResult.rows[0];
     res.status(201).json({
       ...created,
-      owner_email: email,
       role: 'owner'
     });
   } catch (err) {
     console.error('Error creating reimb:', err);
-    res.status(500).json({ error: 'Failed to create reimb' });
+    res.status(500).json({ error: 'Failed to create reimb: ' + err.message });
   }
 });
 
@@ -195,9 +208,8 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
     token = token.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^(.{4})(.{4})$/, '$1-$2');
 
     const reimbQuery = await pool.query(
-      `SELECT r.id, r.name, r.token, r.owner_id, u.email as owner_email
+      `SELECT r.id, r.name, r.token, r.owner_email
        FROM reimbs r
-       JOIN users u ON r.owner_id = u.id
        WHERE r.token = $1`,
       [token]
     );
@@ -207,17 +219,17 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
     }
 
     const reimb = reimbQuery.rows[0];
-    const userId = req.user.id;
+    const email = req.user.email;
 
-    if (reimb.owner_id === userId) {
+    if (reimb.owner_email === email) {
       return res.status(400).json({ error: 'You are the owner of this reimb' });
     }
 
+    // Insert access permission
     await pool.query(
-      `INSERT INTO reimb_access (reimb_id, user_id, role)
-       VALUES ($1, $2, 'viewer')
-       ON CONFLICT (reimb_id, user_id) DO NOTHING`,
-      [reimb.id, userId]
+      `INSERT INTO reimb_access (reimb_id, user_email, role)
+       VALUES ($1, $2, 'viewer')`,
+      [reimb.id, email]
     );
 
     res.json({
@@ -229,7 +241,7 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('Error joining reimb:', err);
-    res.status(500).json({ error: 'Failed to join reimb' });
+    res.status(500).json({ error: 'Failed to join reimb: ' + err.message });
   }
 });
 
@@ -237,14 +249,13 @@ app.post('/api/reimbs/join', requireAuth, async (req, res) => {
 app.get('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
   try {
     const reimbId = parseInt(req.params.id, 10);
-    const userId = req.user.id;
+    const email = req.user.email;
 
-    // Check permission (owner or viewer)
     const accessCheck = await pool.query(
       `SELECT r.id FROM reimbs r
-       LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_id = $2
-       WHERE r.id = $1 AND (r.owner_id = $2 OR ra.user_id = $2)`,
-      [reimbId, userId]
+       LEFT JOIN reimb_access ra ON r.id = ra.reimb_id AND ra.user_email = $2
+       WHERE r.id = $1 AND (r.owner_email = $2 OR ra.user_email = $2)`,
+      [reimbId, email]
     );
 
     if (accessCheck.rows.length === 0) {
@@ -262,7 +273,7 @@ app.get('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
     res.json(expensesQuery.rows);
   } catch (err) {
     console.error('Error getting expenses:', err);
-    res.status(500).json({ error: 'Failed to load expenses' });
+    res.status(500).json({ error: 'Failed to load expenses: ' + err.message });
   }
 });
 
@@ -271,7 +282,6 @@ app.post('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
   try {
     const reimbId = parseInt(req.params.id, 10);
     const { amount, category, date, note } = req.body;
-    const userId = req.user.id;
     const email = req.user.email;
 
     if (!amount || isNaN(amount) || Number(amount) <= 0 || !category || !date) {
@@ -279,8 +289,8 @@ app.post('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
     }
 
     const ownerCheck = await pool.query(
-      `SELECT id FROM reimbs WHERE id = $1 AND owner_id = $2`,
-      [reimbId, userId]
+      `SELECT id FROM reimbs WHERE id = $1 AND owner_email = $2`,
+      [reimbId, email]
     );
     if (ownerCheck.rows.length === 0) {
       return res.status(403).json({ error: 'Only the owner can add expenses' });
@@ -296,7 +306,7 @@ app.post('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
     res.status(201).json(insertResult.rows[0]);
   } catch (err) {
     console.error('Error adding expense:', err);
-    res.status(500).json({ error: 'Failed to save expense' });
+    res.status(500).json({ error: 'Failed to save expense: ' + err.message });
   }
 });
 
@@ -304,13 +314,13 @@ app.post('/api/reimbs/:id/expenses', requireAuth, async (req, res) => {
 app.delete('/api/expenses/:id', requireAuth, async (req, res) => {
   try {
     const expenseId = parseInt(req.params.id, 10);
-    const userId = req.user.id;
+    const email = req.user.email;
 
     const deleteResult = await pool.query(
       `DELETE FROM expenses
-       WHERE id = $1 AND reimb_id IN (SELECT id FROM reimbs WHERE owner_id = $2)
+       WHERE id = $1 AND reimb_id IN (SELECT id FROM reimbs WHERE owner_email = $2)
        RETURNING id`,
-      [expenseId, userId]
+      [expenseId, email]
     );
 
     if (deleteResult.rowCount === 0) {
@@ -320,7 +330,7 @@ app.delete('/api/expenses/:id', requireAuth, async (req, res) => {
     res.json({ success: true, id: expenseId });
   } catch (err) {
     console.error('Error deleting expense:', err);
-    res.status(500).json({ error: 'Failed to delete expense' });
+    res.status(500).json({ error: 'Failed to delete expense: ' + err.message });
   }
 });
 

@@ -1,8 +1,11 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
 const app = express();
@@ -21,10 +24,29 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
+// ── Rate Limiters ──
+// Rate limit auth endpoints: max 20 attempts per 15 minutes per IP
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Please try again after 15 minutes.' }
+});
+
+// Rate limit token joining: max 10 attempts per 15 minutes per IP (prevents brute-force)
+const joinLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many join attempts. Please try again after 15 minutes.' }
+});
+
 app.use(cors());
 app.use(express.json());
 
-// 🔒 SECURITY FIX: Serve ONLY files in the 'public' directory (server.js is never exposed!)
+// 🔒 Security: Serve ONLY files in the 'public' directory
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── MongoDB Atlas Connection ──
@@ -38,6 +60,7 @@ mongoose.connect(MONGODB_URI)
 // ── Mongoose Schemas & Models ──
 const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  password: { type: String, required: true },
   createdAt: { type: Date, default: Date.now }
 });
 
@@ -80,35 +103,76 @@ function requireAuth(req, res, next) {
   }
 }
 
-// Helper: Token Generator (e.g. ABCD-1234)
+// 🔒 Helper: Cryptographically Secure Token Generator (using crypto.randomInt)
 function genReimbToken() {
-  const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let t = "";
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let token = "";
   for (let i = 0; i < 8; i++) {
-    if (i === 4) t += "-";
-    t += c[Math.floor(Math.random() * c.length)];
+    if (i === 4) token += "-";
+    token += chars[crypto.randomInt(0, chars.length)];
   }
-  return t;
+  return token;
 }
 
-// ── Simple Email Login ──
-app.post('/api/auth/login', async (req, res) => {
+// ── Authentication Endpoints (Password-protected with bcryptjs) ──
+
+// 1. Register new user
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
-    let { email } = req.body;
+    let { email, password } = req.body;
     if (!email || !email.includes('@')) {
-      return res.status(400).json({ error: 'Please enter a valid email address' });
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
     }
     email = email.trim().toLowerCase();
 
-    // Find or create user
-    let user = await User.findOne({ email });
-    if (!user) {
-      user = await User.create({ email });
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ error: 'An account with this email already exists. Please log in.' });
     }
 
-    // Issue JWT token (valid for 60 days)
-    const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '60d' });
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const user = await User.create({ email, password: hashedPassword });
 
+    const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '60d' });
+    console.log(`[AUTH] User registered: ${user.email}`);
+
+    res.status(201).json({
+      token,
+      user: { email: user.email }
+    });
+  } catch (err) {
+    console.error('Registration error:', err);
+    res.status(500).json({ error: 'Registration failed: ' + err.message });
+  }
+});
+
+// 2. Login existing user
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  try {
+    let { email, password } = req.body;
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+    if (!password) {
+      return res.status(400).json({ error: 'Please enter your password.' });
+    }
+    email = email.trim().toLowerCase();
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    // Compare hashed password with bcrypt
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid email or password.' });
+    }
+
+    const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '60d' });
     console.log(`[AUTH] User logged in: ${user.email}`);
 
     res.json({
@@ -117,7 +181,7 @@ app.post('/api/auth/login', async (req, res) => {
     });
   } catch (err) {
     console.error('Login error:', err);
-    res.status(500).json({ error: 'Database error: ' + err.message });
+    res.status(500).json({ error: 'Authentication failed: ' + err.message });
   }
 });
 
@@ -178,8 +242,8 @@ app.post('/api/reimbs', requireAuth, async (req, res) => {
   }
 });
 
-// 3. Join reimb using token
-app.post('/api/reimbs/join', requireAuth, async (req, res) => {
+// 3. Join reimb using token (rate-limited against brute force)
+app.post('/api/reimbs/join', requireAuth, joinLimiter, async (req, res) => {
   try {
     let { token } = req.body;
     if (!token) return res.status(400).json({ error: 'Token is required' });

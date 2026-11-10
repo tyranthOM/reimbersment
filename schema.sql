@@ -1,4 +1,4 @@
--- Pure PostgreSQL Schema on Render (Token & Email sync, zero OAuth/Firebase)
+Deploy live for 5ba60d5: feat: simplified token-based sharing and instant email login on Render PostgreSQL-- Pure PostgreSQL Schema on Render (Token & Email sync, zero OAuth/Firebase)
 
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,

@@ -7,17 +7,33 @@ require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'reimbersment-super-secret-key-change-in-prod';
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb+srv://ombhalerao25_db_user:4ZXZBeujkB3FgxgA@reimb.ptowlta.mongodb.net/?retryWrites=true&w=majority&appName=reimb";
+
+// Strict Environment Variables (No hardcoded credentials or fallback secrets!)
+const MONGODB_URI = process.env.MONGODB_URI;
+if (!MONGODB_URI) {
+  console.error('FATAL: MONGODB_URI environment variable is missing.');
+  process.exit(1);
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET environment variable is missing.');
+  process.exit(1);
+}
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname)));
+
+// 🔒 SECURITY FIX: Serve ONLY files in the 'public' directory (server.js is never exposed!)
+app.use(express.static(path.join(__dirname, 'public')));
 
 // ── MongoDB Atlas Connection ──
 mongoose.connect(MONGODB_URI)
   .then(() => console.log('Connected to MongoDB Atlas successfully!'))
-  .catch(err => console.error('MongoDB Atlas connection error:', err));
+  .catch(err => {
+    console.error('MongoDB Atlas connection error:', err);
+    process.exit(1);
+  });
 
 // ── Mongoose Schemas & Models ──
 const userSchema = new mongoose.Schema({
@@ -294,9 +310,9 @@ app.delete('/api/expenses/:id', requireAuth, async (req, res) => {
   }
 });
 
-// Frontend fallback
+// 🔒 Frontend fallback: serves index.html from inside the 'public' folder
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(port, () => console.log(`Server listening on port ${port}`));
